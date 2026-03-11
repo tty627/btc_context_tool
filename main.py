@@ -400,85 +400,35 @@ def build_market_context(
 
 
 def _sanitize_context_for_ai_output(context: Dict) -> Dict:
+    """Prepare context for the AI prompt.
+
+    Keeps all interpretive fields (trend, state, divergence, etc.) so the
+    prompt generator can reference them.  Only strips bulky internal data
+    that would waste tokens without helping the AI (raw series, history
+    arrays, cvd_path, etc.).
+    """
     sanitized = copy.deepcopy(context)
-    sanitized.pop("deployment_context", None)
-    sanitized.pop("market_structure", None)
     sanitized["summary_files"] = {}
 
     for metrics in sanitized.get("timeframes", {}).values():
         if not isinstance(metrics, dict):
             continue
-        metrics.pop("features", None)
-        rsi = metrics.get("rsi")
-        if isinstance(rsi, dict):
-            rsi.pop("state", None)
-            rsi.pop("divergence", None)
+        metrics.pop("bar_state", None)
 
-    orderbook_dynamics = sanitized.get("orderbook_dynamics", {})
-    if isinstance(orderbook_dynamics, dict):
-        orderbook_dynamics.pop("spoofing_risk", None)
-        orderbook_dynamics.pop("wall_behavior", None)
+    oi_trend = sanitized.get("open_interest_trend", {})
+    if isinstance(oi_trend, dict):
+        for period_data in oi_trend.get("periods", {}).values():
+            if isinstance(period_data, dict):
+                period_data.pop("series", None)
 
-    open_interest_trend = sanitized.get("open_interest_trend", {})
-    if isinstance(open_interest_trend, dict):
-        for key in (
-            "trend",
-            "latest_state",
-            "latest_interpretation",
-            "composite_signal",
-            "volume_oi_cvd_state",
-        ):
-            open_interest_trend.pop(key, None)
-        for period_data in open_interest_trend.get("periods", {}).values():
-            if not isinstance(period_data, dict):
-                continue
-            for key in ("trend", "latest_state", "latest_interpretation"):
-                period_data.pop(key, None)
-            for point in period_data.get("series", []):
-                if not isinstance(point, dict):
-                    continue
-                point.pop("state", None)
-                point.pop("interpretation", None)
-
-    long_short_ratio = sanitized.get("long_short_ratio", {})
-    if isinstance(long_short_ratio, dict):
-        long_short_ratio.pop("overall_crowding", None)
-        for subkey in ("global_account", "top_trader_position"):
-            ratio_block = long_short_ratio.get(subkey)
-            if isinstance(ratio_block, dict):
-                ratio_block.pop("crowding", None)
-
-    basis = sanitized.get("basis", {})
-    if isinstance(basis, dict):
-        basis.pop("structure", None)
-
-    funding_spread = sanitized.get("funding_spread", {})
-    if isinstance(funding_spread, dict):
-        funding_spread.pop("signal", None)
+    for ratio_block_key in ("global_account", "top_trader_position"):
+        block = sanitized.get("long_short_ratio", {}).get(ratio_block_key)
+        if isinstance(block, dict):
+            block.pop("history", None)
 
     trade_flow = sanitized.get("trade_flow", {})
     if isinstance(trade_flow, dict):
-        trade_flow.pop("large_trade_direction", None)
-        for window in trade_flow.get("windows", {}).values():
-            if isinstance(window, dict):
-                window.pop("large_trade_direction", None)
-        for layer in trade_flow.get("aggressor_layers", {}).values():
-            if isinstance(layer, dict):
-                layer.pop("large_trade_direction", None)
-        for cluster in trade_flow.get("large_trade_clusters", []):
-            if isinstance(cluster, dict):
-                cluster.pop("dominant_side", None)
-
-    liquidation_heatmap = sanitized.get("liquidation_heatmap", {})
-    if isinstance(liquidation_heatmap, dict):
-        liquidation_heatmap.pop("confidence", None)
-        liquidation_heatmap.pop("model_assumptions", None)
-        for zone in liquidation_heatmap.get("zones", []):
-            if not isinstance(zone, dict):
-                continue
-            zone.pop("confidence", None)
-            zone.pop("assumption", None)
-            zone.pop("estimated_pressure", None)
+        trade_flow.pop("cvd_path", None)
 
     return sanitized
 
