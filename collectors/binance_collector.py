@@ -24,10 +24,35 @@ except ImportError:
 logger = logging.getLogger("btc_context.collector")
 
 
+class _TTLCache:
+    """Simple in-memory cache with per-key TTL (seconds)."""
+
+    def __init__(self, default_ttl: float = 30.0) -> None:
+        self._store: Dict[str, Tuple[float, Any]] = {}
+        self.default_ttl = default_ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if time.time() > expires_at:
+            del self._store[key]
+            return None
+        return value
+
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+        self._store[key] = (time.time() + (ttl if ttl is not None else self.default_ttl), value)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
 class BinanceFuturesCollector:
     """Collect market data from Binance USDT-M Futures REST APIs.
 
     Uses httpx with connection pooling when available; falls back to urllib.
+    Includes optional TTL cache to avoid redundant requests in watch mode.
     """
 
     def __init__(
@@ -36,11 +61,13 @@ class BinanceFuturesCollector:
         timeout: int = REQUEST_TIMEOUT,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
+        cache_ttl: float = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.api_key = self._sanitize_credential(api_key)
         self.api_secret = self._sanitize_credential(api_secret)
+        self._cache = _TTLCache(default_ttl=cache_ttl) if cache_ttl > 0 else None
         self._httpx_client: Optional[Any] = None
         if _HAS_HTTPX:
             self._httpx_client = httpx.Client(
@@ -74,16 +101,30 @@ class BinanceFuturesCollector:
         return body
 
     def _get_json(self, path: str, params: Dict[str, str]) -> Any:
-        """Fetch JSON from a Binance REST endpoint with retry logic.
-
-        Uses httpx (connection pooling) when available, falls back to urllib.
-        """
+        """Fetch JSON from a Binance REST endpoint with retry logic and optional caching."""
+        cache_key = f"{path}|{urlencode(sorted(params.items()))}" if self._cache else ""
+        if self._cache:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.debug("cache hit: %s", path)
+                return cached
         url = f"{self.base_url}{path}"
-        return self._request_with_retry(url, params=params, label=path)
+        result = self._request_with_retry(url, params=params, label=path)
+        if self._cache:
+            self._cache.set(cache_key, result)
+        return result
 
     def _get_json_url(self, url: str) -> Any:
-        """Fetch JSON from an absolute URL with retry logic."""
-        return self._request_with_retry(url, params=None, label=url)
+        """Fetch JSON from an absolute URL with retry logic and optional caching."""
+        if self._cache:
+            cached = self._cache.get(url)
+            if cached is not None:
+                logger.debug("cache hit: %s", url)
+                return cached
+        result = self._request_with_retry(url, params=None, label=url)
+        if self._cache:
+            self._cache.set(url, result)
+        return result
 
     def _signed_get_json(self, path: str, params: Dict[str, str]) -> Any:
         """Fetch signed JSON from a private Binance endpoint."""

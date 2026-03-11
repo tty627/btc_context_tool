@@ -9,7 +9,9 @@ from .deployment import DeploymentMixin
 from .derivatives import DerivativesMixin
 from .liquidation import LiquidationMixin
 from .orderbook import OrderbookMixin
+from .position_sizing import PositionSizingMixin
 from .session import SessionMixin
+from .signal_score import SignalScoreMixin
 from .technical import TechnicalMixin
 from .trade_flow import TradeFlowMixin
 from .volume import VolumeMixin
@@ -24,6 +26,8 @@ class FeatureExtractor(
     LiquidationMixin,
     SessionMixin,
     DeploymentMixin,
+    PositionSizingMixin,
+    SignalScoreMixin,
 ):
     """All feature-extraction capabilities composed via mixins.
 

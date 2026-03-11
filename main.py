@@ -19,7 +19,8 @@ try:
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        SUMMARY_FILE, SYMBOL, TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
+        SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from .context import MarketContextBuilder
     from .features import FeatureExtractor
@@ -32,7 +33,8 @@ except ImportError:
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        SUMMARY_FILE, SYMBOL, TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
+        SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from context import MarketContextBuilder
     from features import FeatureExtractor
@@ -168,8 +170,9 @@ def build_market_context(
     charts_path: Path,
     include_charts: bool,
     chart_generator_cls,
+    cache_ttl: float = 0,
 ) -> Dict:
-    collector = BinanceFuturesCollector(api_key=api_key, api_secret=api_secret)
+    collector = BinanceFuturesCollector(api_key=api_key, api_secret=api_secret, cache_ttl=cache_ttl)
     engine = IndicatorEngine()
     feature_extractor = FeatureExtractor()
     context_builder = MarketContextBuilder()
@@ -367,8 +370,26 @@ def build_market_context(
         liquidation_heatmap=liquidation_heatmap,
         chart_files={},
     )
+    position_sizing = feature_extractor.extract_position_sizing(
+        current_price=price,
+        indicators_by_timeframe=indicators_by_timeframe,
+        account_positions=account_positions,
+    )
+    signal_score = feature_extractor.calculate_signal_score(
+        indicators_by_timeframe=indicators_by_timeframe,
+        orderbook_features=orderbook_features,
+        orderbook_dynamics=orderbook_dynamics,
+        open_interest_trend=open_interest_trend,
+        long_short_ratio=long_short_ratio,
+        trade_flow=trade_flow,
+        funding=funding,
+        basis=basis,
+    )
+
     context["session_context"] = session_context
     context["deployment_context"] = deployment_context
+    context["position_sizing"] = position_sizing
+    context["signal_score"] = signal_score
     context["summary_files"] = {}
 
     if include_charts and chart_generator_cls is not None:
@@ -531,6 +552,34 @@ def _run_ai_analysis(api_key: str, model: str, prompt_text: str) -> str:
     return advisor.analyze(prompt_text)
 
 
+def _send_telegram(context: Dict, analysis_text: str = None) -> None:
+    bot_token = _sanitize_env_credential(os.getenv(TELEGRAM_BOT_TOKEN_ENV))
+    chat_id = os.getenv(TELEGRAM_CHAT_ID_ENV, "").strip()
+    if not bot_token or not chat_id:
+        logger.warning(
+            "Telegram notification skipped: %s and/or %s not set",
+            TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        )
+        return
+    try:
+        try:
+            from .advisor.telegram_notifier import TelegramNotifier
+        except ImportError:
+            from advisor.telegram_notifier import TelegramNotifier
+        notifier = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
+        signal_score = context.get("signal_score", {})
+        ok = notifier.send_analysis_summary(
+            signal_score=signal_score,
+            analysis_text=analysis_text,
+        )
+        if ok:
+            logger.info("Telegram notification sent")
+        else:
+            logger.warning("Telegram notification may have failed")
+    except Exception as exc:
+        logger.error("Telegram notification error: %s", exc)
+
+
 def _resolve_analysis_path(context_path: Path) -> Path:
     if context_path.parent == AI_ANALYSIS_FILE.parent:
         return AI_ANALYSIS_FILE
@@ -649,6 +698,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         metavar="SECONDS",
         help="Re-run every N seconds (0 = single run). E.g. --watch 300 for 5-minute intervals.",
     )
+    parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Generate an HTML dashboard report in the output directory",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="Cache API responses for N seconds (useful with --watch to reduce redundant calls, e.g. --cache-ttl 30)",
+    )
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help=(
+            "Send analysis summary to Telegram. "
+            f"Requires env vars {TELEGRAM_BOT_TOKEN_ENV} and {TELEGRAM_CHAT_ID_ENV}."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -734,6 +803,7 @@ def _run_once(args: argparse.Namespace) -> int:
         charts_path=charts_path,
         include_charts=include_charts,
         chart_generator_cls=chart_generator_cls,
+        cache_ttl=args.cache_ttl,
     )
     ai_context = write_outputs(context, context_path, report_path)
     if args.include_summary:
@@ -750,6 +820,7 @@ def _run_once(args: argparse.Namespace) -> int:
         for timeframe, file_path in context["chart_files"].items():
             logger.info("  %s: %s", timeframe, file_path)
 
+    analysis = ""
     if args.auto_analyze:
         openai_key = _sanitize_env_credential(os.getenv(OPENAI_API_KEY_ENV))
         if not openai_key:
@@ -765,6 +836,24 @@ def _run_once(args: argparse.Namespace) -> int:
         print("\n" + "=" * 60)
         print(analysis)
         print("=" * 60)
+
+    if args.html:
+        try:
+            try:
+                from .reports.html_report import HtmlReportGenerator
+            except ImportError:
+                from reports.html_report import HtmlReportGenerator
+            html_content = HtmlReportGenerator().build(
+                context, analysis_text=analysis if args.auto_analyze else "",
+            )
+            html_path = context_path.with_suffix(".html")
+            html_path.write_text(html_content, encoding="utf-8")
+            logger.info("HTML dashboard written to %s", html_path)
+        except Exception as exc:
+            logger.warning("HTML report generation failed: %s", exc)
+
+    if args.telegram:
+        _send_telegram(context, analysis_text=analysis if args.auto_analyze else None)
 
     return 0
 

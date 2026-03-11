@@ -342,8 +342,21 @@ class PromptGenerator:
                 )
             lines.append("")
 
+        signal = context.get("signal_score", {})
+        if signal:
+            components = signal.get("components", {})
+            lines.append("综合信号评分（0=极度看空, 50=中性, 100=极度看多）：")
+            lines.append(
+                f"composite={signal.get('composite_score')} "
+                f"bias={signal.get('bias')} strength={signal.get('strength')}"
+            )
+            for name, comp in components.items():
+                lines.append(f"  {name}: score={comp.get('score')}")
+            lines.append("")
+
         lines.extend(self._build_derivatives_lines(context))
         lines.extend(self._build_volume_profile_lines(context.get("volume_profile", {})))
+        lines.extend(self._build_position_sizing_lines(context.get("position_sizing", {})))
         lines.extend(self._build_options_lines(context.get("options_iv", {})))
         lines.extend(self._build_account_detail_lines(context.get("account_positions", {})))
 
@@ -625,6 +638,36 @@ class PromptGenerator:
             "账户仓位明细：",
             f"symbol_position={account_positions.get('symbol_position')}",
             f"active_positions={account_positions.get('active_positions')}",
+            "",
+        ]
+
+    @staticmethod
+    def _build_position_sizing_lines(sizing: Dict) -> list[str]:
+        if not sizing or not sizing.get("available"):
+            return []
+        ref = sizing.get("reference_levels", {})
+        long_ref = ref.get("long", {})
+        short_ref = ref.get("short", {})
+        return [
+            "仓位计算参考（默认 1% 风险，10x 杠杆，基于 ATR）：",
+            (
+                f"ATR周期={sizing.get('atr_timeframe')} ATR={sizing.get('atr')} "
+                f"SL距离={sizing.get('sl_distance')} SL%={sizing.get('sl_pct')}"
+            ),
+            (
+                f"建议仓位={sizing.get('position_size_usdt')}U "
+                f"({sizing.get('position_size_btc')} BTC) "
+                f"保证金={sizing.get('margin_required')}U "
+                f"占比={sizing.get('margin_usage_pct')}%"
+            ),
+            (
+                f"做多参考: SL={long_ref.get('stop_loss')} "
+                f"TP1={long_ref.get('tp1')}(RR 2:1) TP2={long_ref.get('tp2')}(RR 3:1)"
+            ),
+            (
+                f"做空参考: SL={short_ref.get('stop_loss')} "
+                f"TP1={short_ref.get('tp1')}(RR 2:1) TP2={short_ref.get('tp2')}(RR 3:1)"
+            ),
             "",
         ]
 
