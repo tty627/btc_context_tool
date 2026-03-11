@@ -23,7 +23,8 @@ class PromptGenerator:
         "5 成交流、主动买卖盘、成交量变化、CVD 与大单方向\n"
         "6 衍生品数据（资金费率、未平仓量、多空比、基差、跨交易所费率差）\n"
         "7 成交量分布（POC / HVN / LVN）\n"
-        "8 账户当前仓位与风险暴露（如有）\n"
+        "8 波动率与止损定位（ATR、布林带宽度、VWAP）\n"
+        "9 账户当前仓位与风险暴露（如有）\n"
         "\n"
         "执行原则：\n"
         "1 不要给出绝对确定的预测，只能给概率和条件化方案\n"
@@ -63,7 +64,7 @@ class PromptGenerator:
         "- 分批方式：最多 1-3 档，写清每档的大致仓位占比\n"
         "- 触发条件：什么条件成立才执行\n"
         "- 若未触发怎么办：继续等待 / 撤单 / 改价 / 重新评估，并给出大致时间窗口\n"
-        "- 止损：必须与结构失效位对应\n"
+        "- 止损：必须与结构失效位对应，并参考 ATR 建议止损距离验证合理性\n"
         "- 止盈：至少给出 TP1 / TP2 或分批止盈逻辑\n"
         "- 预期盈亏比：若明显偏低，直接建议观望\n"
         "- 仓位建议：轻仓 / 中性 / 偏重，并说明原因\n"
@@ -184,6 +185,9 @@ class PromptGenerator:
             macd = metrics.get("macd", {})
             kdj = metrics.get("kdj", {})
             rsi = metrics.get("rsi", {})
+            atr = metrics.get("atr", {})
+            bollinger = metrics.get("bollinger", {})
+            vwap = metrics.get("vwap")
             features = metrics.get("features", {})
             bar_state = metrics.get("bar_state", {})
             lines.append(f"[{tf}] 技术结构：")
@@ -191,6 +195,18 @@ class PromptGenerator:
             lines.append(f"MACD DIF={macd.get('dif')} DEA={macd.get('dea')} HIST={macd.get('hist')}")
             lines.append(f"KDJ K={kdj.get('k')} D={kdj.get('d')} J={kdj.get('j')}")
             lines.append(f"RSI14={rsi.get('14')} state={rsi.get('state')} divergence={rsi.get('divergence')}")
+            lines.append(
+                f"ATR={atr.get('atr')} ATR%={atr.get('atr_pct')} "
+                f"suggested_SL_distance={atr.get('suggested_sl_distance')} "
+                f"suggested_SL%={atr.get('suggested_sl_pct')}"
+            )
+            lines.append(
+                f"Bollinger upper={bollinger.get('upper')} mid={bollinger.get('middle')} "
+                f"lower={bollinger.get('lower')} bandwidth={bollinger.get('bandwidth')} "
+                f"%B={bollinger.get('percent_b')}"
+            )
+            if vwap:
+                lines.append(f"VWAP={vwap}")
             lines.append(
                 f"features trend={features.get('trend')} momentum={features.get('momentum')} "
                 f"kdj_state={features.get('kdj_state')} rsi_state={features.get('rsi_state')} "
@@ -251,9 +267,29 @@ class PromptGenerator:
                 f"aggressive_sweep_quote={orderbook_dynamics.get('aggressive_sweep_quote')} "
                 f"pull_without_trade_quote={orderbook_dynamics.get('pull_without_trade_quote')}"
             )
-            lines.append(f"persistent_walls={orderbook_dynamics.get('persistent_walls')}")
-            lines.append(f"top_bid_level_activity={orderbook_dynamics.get('top_bid_level_activity')}")
-            lines.append(f"top_ask_level_activity={orderbook_dynamics.get('top_ask_level_activity')}")
+            pw = orderbook_dynamics.get("persistent_walls", [])
+            if pw and isinstance(pw, list):
+                lines.append(f"persistent_walls({len(pw)}):")
+                for w in pw[:5]:
+                    if isinstance(w, dict):
+                        lines.append(
+                            f"  side={w.get('side')} price={w.get('price')} "
+                            f"avg_qty={w.get('avg_qty')} lifetime={w.get('lifetime_seconds')}s"
+                        )
+            else:
+                lines.append("persistent_walls=none")
+            tba = orderbook_dynamics.get("top_bid_level_activity", [])
+            taa = orderbook_dynamics.get("top_ask_level_activity", [])
+            if tba and isinstance(tba, list):
+                lines.append(f"top_bid_levels({len(tba)}):")
+                for lv in tba[:3]:
+                    if isinstance(lv, dict):
+                        lines.append(f"  price={lv.get('price')} net_change={lv.get('net_change')}")
+            if taa and isinstance(taa, list):
+                lines.append(f"top_ask_levels({len(taa)}):")
+                for lv in taa[:3]:
+                    if isinstance(lv, dict):
+                        lines.append(f"  price={lv.get('price')} net_change={lv.get('net_change')}")
             lines.append("")
 
         trade_flow = context.get("trade_flow", {})
@@ -272,10 +308,24 @@ class PromptGenerator:
                 f"large_sell_quote={trade_flow.get('large_sell_quote')} "
                 f"large_trade_direction={trade_flow.get('large_trade_direction')}"
             )
-            lines.append(f"rolling_windows={trade_flow.get('windows')}")
-            lines.append(f"aggressor_layers={trade_flow.get('aggressor_layers')}")
-            lines.append(f"large_trade_clusters={trade_flow.get('large_trade_clusters')}")
-            lines.append(f"absorption_zones={trade_flow.get('absorption_zones')}")
+            lines.extend(PromptGenerator._summarize_trade_flow_windows(trade_flow.get("windows")))
+            lines.extend(PromptGenerator._summarize_trade_flow_layers(trade_flow.get("aggressor_layers")))
+            clusters = trade_flow.get("large_trade_clusters", [])
+            if clusters:
+                lines.append(f"large_trade_clusters({len(clusters)}):")
+                for c in clusters[:5]:
+                    lines.append(
+                        f"  price={c.get('price')} side={c.get('dominant_side')} "
+                        f"total_quote={c.get('total_quote')} count={c.get('count')}"
+                    )
+            absorption = trade_flow.get("absorption_zones", [])
+            if absorption:
+                lines.append(f"absorption_zones({len(absorption)}):")
+                for z in absorption[:5]:
+                    lines.append(
+                        f"  price={z.get('price')} absorbed_quote={z.get('absorbed_quote')} "
+                        f"side={z.get('side')}"
+                    )
             lines.append("")
 
         liquidation_heatmap = context.get("liquidation_heatmap", {})
@@ -391,6 +441,43 @@ class PromptGenerator:
         return ["数据质量与降级提示：", *notes]
 
     @staticmethod
+    def _summarize_oi_periods(periods: Dict) -> list[str]:
+        """Summarize OI period data: only trend/latest/delta, skip full series."""
+        if not periods or not isinstance(periods, dict):
+            return []
+        lines: list[str] = []
+        for period_key, data in periods.items():
+            if not isinstance(data, dict):
+                continue
+            lines.append(
+                f"  {period_key}: trend={data.get('trend')} delta_pct={data.get('delta_pct')} "
+                f"vs_avg_pct={data.get('vs_avg_pct')} latest_state={data.get('latest_state')} "
+                f"points={len(data.get('series', []))}"
+            )
+        return lines
+
+    @staticmethod
+    def _summarize_ratio_block(block: Dict) -> str:
+        """Summarize a long/short ratio block: latest value + trend, skip full series."""
+        if not block or not isinstance(block, dict):
+            return "N/A"
+        latest = block.get("latest_ratio") or block.get("long_short_ratio")
+        trend = block.get("trend") or block.get("crowding")
+        series = block.get("series", [])
+        latest_long = block.get("latest_long") or block.get("long_account")
+        latest_short = block.get("latest_short") or block.get("short_account")
+        parts = [f"ratio={latest}"]
+        if latest_long is not None:
+            parts.append(f"long={latest_long}")
+        if latest_short is not None:
+            parts.append(f"short={latest_short}")
+        if trend:
+            parts.append(f"trend={trend}")
+        if series:
+            parts.append(f"points={len(series)}")
+        return " ".join(parts)
+
+    @staticmethod
     def _build_derivatives_lines(context: Dict) -> list[str]:
         lines: list[str] = []
 
@@ -406,16 +493,27 @@ class PromptGenerator:
                 f"latest_interpretation={oi_trend.get('latest_interpretation')} "
                 f"composite_signal={oi_trend.get('composite_signal')}"
             )
-            lines.append(f"periods={oi_trend.get('periods')}")
-            lines.append(f"volume_oi_cvd_state={oi_trend.get('volume_oi_cvd_state')}")
+            period_lines = PromptGenerator._summarize_oi_periods(oi_trend.get("periods"))
+            if period_lines:
+                lines.append("OI 分周期摘要：")
+                lines.extend(period_lines)
+            voc = oi_trend.get("volume_oi_cvd_state")
+            if isinstance(voc, dict):
+                lines.append(
+                    f"volume_oi_cvd: volume_trend={voc.get('volume_trend')} "
+                    f"oi_trend={voc.get('oi_trend')} cvd_trend={voc.get('cvd_trend')} "
+                    f"interpretation={voc.get('interpretation')}"
+                )
+            elif voc is not None:
+                lines.append(f"volume_oi_cvd_state={voc}")
             lines.append("")
 
         long_short_ratio = context.get("long_short_ratio", {})
         if long_short_ratio:
             lines.append("多空持仓比：")
             lines.append(f"overall_crowding={long_short_ratio.get('overall_crowding')}")
-            lines.append(f"global_account={long_short_ratio.get('global_account')}")
-            lines.append(f"top_trader_position={long_short_ratio.get('top_trader_position')}")
+            lines.append(f"global_account: {PromptGenerator._summarize_ratio_block(long_short_ratio.get('global_account'))}")
+            lines.append(f"top_trader: {PromptGenerator._summarize_ratio_block(long_short_ratio.get('top_trader_position'))}")
             lines.append("")
 
         funding = context.get("funding", {})
@@ -480,15 +578,25 @@ class PromptGenerator:
             ),
         ]
         session_profiles = volume_profile.get("session_profiles", {})
-        if session_profiles:
-            lines.append(
-                f"session_profiles(tf={volume_profile.get('session_source_timeframe')})={session_profiles}"
-            )
+        if session_profiles and isinstance(session_profiles, dict):
+            stf = volume_profile.get("session_source_timeframe", "")
+            lines.append(f"session_profiles(tf={stf}):")
+            for session_name, sp in session_profiles.items():
+                if isinstance(sp, dict):
+                    lines.append(
+                        f"  {session_name}: poc={sp.get('poc_price')} "
+                        f"hvn={sp.get('hvn_prices')} lvn={sp.get('lvn_prices')}"
+                    )
         anchored_profiles = volume_profile.get("anchored_profiles", [])
-        if anchored_profiles:
-            lines.append(
-                f"anchored_profiles(tf={volume_profile.get('anchored_source_timeframe')})={anchored_profiles}"
-            )
+        if anchored_profiles and isinstance(anchored_profiles, list):
+            atf = volume_profile.get("anchored_source_timeframe", "")
+            lines.append(f"anchored_profiles(tf={atf}):")
+            for ap in anchored_profiles[:5]:
+                if isinstance(ap, dict):
+                    lines.append(
+                        f"  anchor={ap.get('anchor_label')} vwap={ap.get('vwap')} "
+                        f"poc={ap.get('poc_price')}"
+                    )
         lines.append("")
         return lines
 
@@ -519,6 +627,35 @@ class PromptGenerator:
             f"active_positions={account_positions.get('active_positions')}",
             "",
         ]
+
+    @staticmethod
+    def _summarize_trade_flow_windows(windows: object) -> list[str]:
+        if not windows or not isinstance(windows, dict):
+            return []
+        lines = ["rolling_windows:"]
+        for label, w in windows.items():
+            if not isinstance(w, dict):
+                continue
+            lines.append(
+                f"  {label}: buy={w.get('buy_quote')} sell={w.get('sell_quote')} "
+                f"delta={w.get('delta_quote')} cvd={w.get('cvd_qty')} "
+                f"direction={w.get('large_trade_direction')}"
+            )
+        return lines
+
+    @staticmethod
+    def _summarize_trade_flow_layers(layers: object) -> list[str]:
+        if not layers or not isinstance(layers, dict):
+            return []
+        lines = ["aggressor_layers:"]
+        for label, layer in layers.items():
+            if not isinstance(layer, dict):
+                continue
+            lines.append(
+                f"  {label}: buy={layer.get('buy_quote')} sell={layer.get('sell_quote')} "
+                f"delta={layer.get('delta_quote')} direction={layer.get('large_trade_direction')}"
+            )
+        return lines
 
     @staticmethod
     def _humanize_reason(reason: object) -> str:

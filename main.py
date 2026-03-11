@@ -1,65 +1,38 @@
 import argparse
+import concurrent.futures
 import copy
 import json
+import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
-if __package__:
+logger = logging.getLogger("btc_context")
+
+try:
     from .collectors import BinanceFuturesCollector
     from .config import (
-        AGG_TRADES_LIMIT,
-        BINANCE_API_KEY_ENV,
-        BINANCE_API_SECRET_ENV,
-        CHART_BARS,
-        CHART_DIR,
-        CONTEXT_FILE,
-        DEPTH_LIMIT,
-        KLINE_LIMIT,
-        LARGE_TRADE_QUANTILE,
-        LONG_SHORT_LIMIT,
-        LONG_SHORT_PERIOD,
-        OI_LIMIT,
-        OI_PERIOD,
-        ORDERBOOK_DYNAMIC_INTERVAL,
-        ORDERBOOK_DYNAMIC_SAMPLES,
-        REPORT_FILE,
-        SUMMARY_FILE,
-        SYMBOL,
-        TIMEFRAMES,
-        VOLUME_PROFILE_BINS,
-        VOLUME_PROFILE_WINDOW,
+        AGG_TRADES_LIMIT, AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
+        LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
+        OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
+        SUMMARY_FILE, SYMBOL, TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from .context import MarketContextBuilder
     from .features import FeatureExtractor
     from .indicators import IndicatorEngine
     from .reports import PromptGenerator, SummaryTableGenerator
-else:
+except ImportError:
     from collectors import BinanceFuturesCollector
     from config import (
-        AGG_TRADES_LIMIT,
-        BINANCE_API_KEY_ENV,
-        BINANCE_API_SECRET_ENV,
-        CHART_BARS,
-        CHART_DIR,
-        CONTEXT_FILE,
-        DEPTH_LIMIT,
-        KLINE_LIMIT,
-        LARGE_TRADE_QUANTILE,
-        LONG_SHORT_LIMIT,
-        LONG_SHORT_PERIOD,
-        OI_LIMIT,
-        OI_PERIOD,
-        ORDERBOOK_DYNAMIC_INTERVAL,
-        ORDERBOOK_DYNAMIC_SAMPLES,
-        REPORT_FILE,
-        SUMMARY_FILE,
-        SYMBOL,
-        TIMEFRAMES,
-        VOLUME_PROFILE_BINS,
-        VOLUME_PROFILE_WINDOW,
+        AGG_TRADES_LIMIT, AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
+        LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
+        OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
+        SUMMARY_FILE, SYMBOL, TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from context import MarketContextBuilder
     from features import FeatureExtractor
@@ -69,9 +42,9 @@ else:
 
 def _load_chart_generator():
     try:
-        if __package__:
+        try:
             from .charts import KlineChartGenerator
-        else:
+        except ImportError:
             from charts import KlineChartGenerator
         return KlineChartGenerator, None
     except ModuleNotFoundError as exc:
@@ -84,10 +57,17 @@ def _load_chart_generator():
         raise
 
 
+def _make_timestamped_path(base_path: Path) -> Path:
+    """Insert a UTC timestamp before the file extension: foo.json -> foo_20260311_143000.json"""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return base_path.with_name(f"{base_path.stem}_{ts}{base_path.suffix}")
+
+
 def _resolve_output_files(
     context_file: Optional[str],
     report_file: Optional[str],
     chart_dir: Optional[str],
+    history: bool = False,
 ) -> Tuple[Path, Path, Path]:
     if context_file:
         context_path = Path(context_file).expanduser().resolve()
@@ -103,6 +83,10 @@ def _resolve_output_files(
         charts_path = Path(chart_dir).expanduser().resolve()
     else:
         charts_path = CHART_DIR
+
+    if history:
+        context_path = _make_timestamped_path(context_path)
+        report_path = _make_timestamped_path(report_path)
 
     return context_path, report_path, charts_path
 
@@ -190,18 +174,84 @@ def build_market_context(
     feature_extractor = FeatureExtractor()
     context_builder = MarketContextBuilder()
 
-    klines_by_timeframe = collector.get_multi_klines(symbol, list(timeframes), kline_limit)
-    support_timeframes = ("5m", "15m", "1h")
-    missing_support = [timeframe for timeframe in support_timeframes if timeframe not in klines_by_timeframe]
-    if missing_support:
-        klines_by_timeframe.update(
-            collector.get_multi_klines(
-                symbol,
-                missing_support,
-                max(kline_limit, 120),
-            )
-        )
+    # ── Phase 1: fire all independent network calls in parallel ──────────
+    all_kline_intervals = list(dict.fromkeys(
+        list(timeframes) + [tf for tf in ("5m", "15m", "1h") if tf not in timeframes]
+    ))
+    all_kline_limit = max(kline_limit, 120)
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        fut_klines = {
+            interval: pool.submit(collector.get_klines, symbol, interval, all_kline_limit)
+            for interval in all_kline_intervals
+        }
+        fut_orderbook_snapshots = pool.submit(
+            collector.get_orderbook_snapshots,
+            symbol=symbol, limit=depth_limit,
+            samples=orderbook_dynamic_samples,
+            interval_seconds=orderbook_dynamic_interval,
+        )
+        fut_agg_trades = pool.submit(collector.get_agg_trades, symbol, agg_trades_limit)
+        fut_oi = pool.submit(collector.get_open_interest, symbol)
+        fut_funding = pool.submit(collector.get_funding, symbol)
+        fut_ticker = pool.submit(collector.get_ticker_24h, symbol)
+        fut_global_ls = pool.submit(
+            collector.get_global_long_short_ratio,
+            symbol=symbol, period=long_short_period, limit=long_short_limit,
+        )
+        fut_top_ls = pool.submit(
+            collector.get_top_trader_long_short_ratio,
+            symbol=symbol, period=long_short_period, limit=long_short_limit,
+        )
+        fut_oi_hist = {
+            period: pool.submit(
+                collector.get_open_interest_hist, symbol, period=period, limit=oi_limit,
+            )
+            for period in ("5m", "15m", "1h")
+        }
+        fut_force = pool.submit(collector.get_force_orders, symbol, limit=100)
+
+        if include_account:
+            fut_account = pool.submit(collector.get_account_positions, symbol=symbol)
+        else:
+            fut_account = None
+
+        # ── Collect klines results ───────────────────────────────────────
+        klines_by_timeframe: Dict[str, list] = {}
+        for interval, fut in fut_klines.items():
+            klines_by_timeframe[interval] = fut.result()
+
+        # ── Collect other phase-1 results ────────────────────────────────
+        agg_trades = fut_agg_trades.result()
+        open_interest = fut_oi.result()
+        funding = fut_funding.result()
+        ticker_24h = fut_ticker.result()
+        global_long_short = fut_global_ls.result()
+        top_trader_ratio = fut_top_ls.result()
+        oi_histories = {period: fut.result() for period, fut in fut_oi_hist.items()}
+        force_orders = fut_force.result()
+        orderbook_snapshots = fut_orderbook_snapshots.result()
+
+        if fut_account is not None:
+            account_positions = fut_account.result()
+        else:
+            account_positions = {
+                "available": False,
+                "reason": "disabled_by_flag",
+                "active_positions_count": 0,
+                "active_positions": [],
+                "symbol_position": None,
+            }
+
+        # ── Phase 2: cross-exchange funding (needs funding result) ───────
+        fut_cross_funding = pool.submit(
+            collector.get_cross_exchange_funding,
+            symbol=symbol,
+            binance_funding_rate=funding.get("funding_rate"),
+        )
+        cross_exchange_funding = fut_cross_funding.result()
+
+    # ── Phase 3: compute indicators and features (CPU, no I/O) ───────────
     indicators_by_timeframe: Dict[str, Dict] = {}
     now_ms = int(time.time() * 1000)
     for timeframe in timeframes:
@@ -220,37 +270,14 @@ def build_market_context(
     for timeframe, features in timeframe_features.items():
         indicators_by_timeframe[timeframe]["features"] = features
 
-    if not include_account:
-        account_positions = {
-            "available": False,
-            "reason": "disabled_by_flag",
-            "active_positions_count": 0,
-            "active_positions": [],
-            "symbol_position": None,
-        }
-    else:
-        account_positions = collector.get_account_positions(symbol=symbol)
-
-    orderbook = collector.get_orderbook(symbol, depth_limit)
-    orderbook_features = feature_extractor.extract_orderbook_features(orderbook)
-    agg_trades = collector.get_agg_trades(symbol, agg_trades_limit)
-    trade_flow = feature_extractor.extract_trade_flow_features(agg_trades, large_trade_quantile)
-    orderbook_snapshots = collector.get_orderbook_snapshots(
-        symbol=symbol,
-        limit=depth_limit,
-        samples=orderbook_dynamic_samples,
-        interval_seconds=orderbook_dynamic_interval,
-    )
+    orderbook = orderbook_snapshots[0] if orderbook_snapshots else collector.get_orderbook(symbol, depth_limit)
     if not orderbook_snapshots:
         orderbook_snapshots = [orderbook]
+    orderbook_features = feature_extractor.extract_orderbook_features(orderbook)
+    trade_flow = feature_extractor.extract_trade_flow_features(agg_trades, large_trade_quantile)
     orderbook_dynamics = feature_extractor.extract_orderbook_dynamics(orderbook_snapshots, trades=agg_trades)
 
-    open_interest = collector.get_open_interest(symbol)
     volume_change = feature_extractor.extract_volume_change(klines_by_timeframe)
-    oi_histories = {
-        period: collector.get_open_interest_hist(symbol, period=period, limit=oi_limit)
-        for period in ("5m", "15m", "1h")
-    }
     price_candles_by_period = {
         period: klines_by_timeframe.get(period, [])
         for period in ("5m", "15m", "1h")
@@ -264,31 +291,15 @@ def build_market_context(
         summary_period=oi_period,
     )
 
-    global_long_short = collector.get_global_long_short_ratio(
-        symbol=symbol,
-        period=long_short_period,
-        limit=long_short_limit,
-    )
-    top_trader_ratio = collector.get_top_trader_long_short_ratio(
-        symbol=symbol,
-        period=long_short_period,
-        limit=long_short_limit,
-    )
     long_short_ratio = feature_extractor.extract_long_short_ratio(
         global_account_ratio=global_long_short,
         top_trader_ratio=top_trader_ratio,
     )
 
-    funding = collector.get_funding(symbol)
     basis = feature_extractor.extract_basis(funding)
-    cross_exchange_funding = collector.get_cross_exchange_funding(
-        symbol=symbol,
-        binance_funding_rate=funding.get("funding_rate"),
-    )
     funding_spread = feature_extractor.extract_cross_exchange_funding_spread(cross_exchange_funding)
     options_iv = feature_extractor.extract_options_iv_placeholder()
 
-    ticker_24h = collector.get_ticker_24h(symbol)
     recent_4h_range = feature_extractor.extract_recent_4h_range(klines_by_timeframe.get("15m", []))
     profile_tf = "1h" if "1h" in klines_by_timeframe else timeframes[0]
     volume_profile = feature_extractor.extract_volume_profile(
@@ -316,7 +327,6 @@ def build_market_context(
 
     primary_tf = timeframes[0]
     price = indicators_by_timeframe[primary_tf]["price"]
-    force_orders = collector.get_force_orders(symbol, limit=100)
     liquidation_heatmap = feature_extractor.extract_liquidation_heatmap(
         current_price=price,
         recent_high=recent_4h_range["high"],
@@ -481,6 +491,12 @@ def write_outputs(context: Dict, context_path: Path, report_path: Path) -> Dict:
     with report_path.open("w", encoding="utf-8") as f:
         f.write(prompt)
     _cleanup_alternate_prompt_output(report_path)
+
+    cn_chars = sum(1 for ch in prompt if "\u4e00" <= ch <= "\u9fff")
+    en_chars = len(prompt) - cn_chars
+    est_tokens = int(cn_chars / 3.5 + en_chars / 4)
+    logger.info("prompt size: %d chars, ~%d tokens (estimate)", len(prompt), est_tokens)
+
     return ai_context
 
 def write_summary_output(context: Dict, context_path: Path) -> Path:
@@ -492,6 +508,33 @@ def write_summary_output(context: Dict, context_path: Path) -> Path:
     with summary_path.open("w", encoding="utf-8") as f:
         f.write(summary)
     return summary_path
+
+
+def _load_ai_advisor():
+    try:
+        try:
+            from .advisor import AIAdvisor
+        except ImportError:
+            from advisor import AIAdvisor
+        return AIAdvisor
+    except ImportError:
+        return None
+
+
+def _run_ai_analysis(api_key: str, model: str, prompt_text: str) -> str:
+    AIAdvisor = _load_ai_advisor()
+    if AIAdvisor is None:
+        raise RuntimeError("advisor module could not be loaded")
+    advisor = AIAdvisor(api_key=api_key, model=model)
+    token_est = advisor.estimate_tokens(prompt_text)
+    print(f"estimated prompt tokens: ~{token_est}")
+    return advisor.analyze(prompt_text)
+
+
+def _resolve_analysis_path(context_path: Path) -> Path:
+    if context_path.parent == AI_ANALYSIS_FILE.parent:
+        return AI_ANALYSIS_FILE
+    return context_path.parent / AI_ANALYSIS_FILE.name
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -569,6 +612,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--no-charts", action="store_true", help="Disable kline screenshot generation")
     parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Append UTC timestamp to output filenames to preserve historical runs",
+    )
+    parser.add_argument(
         "--include-account",
         action="store_true",
         help=(
@@ -581,114 +629,184 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Disable account position collection even if API credentials are present.",
     )
+    parser.add_argument(
+        "--auto-analyze",
+        action="store_true",
+        help=(
+            "Send the generated prompt to OpenAI and write the AI analysis to file. "
+            f"Requires env var {OPENAI_API_KEY_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--ai-model",
+        default=OPENAI_MODEL,
+        help=f"OpenAI model to use for --auto-analyze (default: {OPENAI_MODEL})",
+    )
+    parser.add_argument(
+        "--watch",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="Re-run every N seconds (0 = single run). E.g. --watch 300 for 5-minute intervals.",
+    )
     return parser.parse_args(argv)
 
 
+def _run_once(args: argparse.Namespace) -> int:
+    """Execute a single collect -> analyze cycle. Returns 0 on success."""
+    timeframes = _parse_timeframes(args.timeframes)
+    if args.kline_limit <= 0:
+        raise ValueError("kline-limit must be greater than 0")
+    if args.depth_limit <= 0:
+        raise ValueError("depth-limit must be greater than 0")
+    if args.agg_trades_limit <= 0:
+        raise ValueError("agg-trades-limit must be greater than 0")
+    if not 0 <= args.large_trade_quantile <= 1:
+        raise ValueError("large-trade-quantile must be between 0 and 1")
+    if args.oi_limit <= 0:
+        raise ValueError("oi-limit must be greater than 0")
+    if args.long_short_limit <= 0:
+        raise ValueError("long-short-limit must be greater than 0")
+    if args.orderbook_dynamic_samples <= 0:
+        raise ValueError("orderbook-dynamic-samples must be greater than 0")
+    if args.orderbook_dynamic_interval < 0:
+        raise ValueError("orderbook-dynamic-interval must be >= 0")
+    if args.volume_profile_window <= 0:
+        raise ValueError("volume-profile-window must be greater than 0")
+    if args.volume_profile_bins <= 0:
+        raise ValueError("volume-profile-bins must be greater than 0")
+    if args.include_account and args.no_account:
+        raise ValueError("include-account and no-account cannot both be set")
+
+    use_history = args.history or args.watch > 0
+    context_path, report_path, charts_path = _resolve_output_files(
+        args.context_file,
+        args.report_file,
+        args.chart_dir,
+        history=use_history,
+    )
+
+    api_key = _sanitize_env_credential(os.getenv(BINANCE_API_KEY_ENV))
+    api_secret = _sanitize_env_credential(os.getenv(BINANCE_API_SECRET_ENV))
+    if _looks_like_placeholder_credential(api_key) or _looks_like_placeholder_credential(api_secret):
+        logger.warning(
+            "detected placeholder %s/%s; account position collection disabled",
+            BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        )
+        api_key = None
+        api_secret = None
+    has_api_credentials = bool(api_key and api_secret)
+    include_account = not args.no_account and (args.include_account or has_api_credentials)
+    if include_account and (not api_key or not api_secret):
+        logger.warning(
+            "account collection enabled but usable %s/%s not found; "
+            "account position data will be unavailable",
+            BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        )
+
+    chart_generator_cls = None
+    chart_warning = None
+    include_charts = not args.no_charts
+    if include_charts:
+        chart_generator_cls, chart_warning = _load_chart_generator()
+        if chart_generator_cls is None:
+            include_charts = False
+            logger.warning("%s", chart_warning)
+
+    context = build_market_context(
+        symbol=args.symbol,
+        timeframes=timeframes,
+        kline_limit=args.kline_limit,
+        depth_limit=args.depth_limit,
+        agg_trades_limit=args.agg_trades_limit,
+        large_trade_quantile=args.large_trade_quantile,
+        oi_period=args.oi_period,
+        oi_limit=args.oi_limit,
+        long_short_period=args.long_short_period,
+        long_short_limit=args.long_short_limit,
+        orderbook_dynamic_samples=args.orderbook_dynamic_samples,
+        orderbook_dynamic_interval=args.orderbook_dynamic_interval,
+        volume_profile_window=args.volume_profile_window,
+        volume_profile_bins=args.volume_profile_bins,
+        include_account=include_account,
+        api_key=api_key,
+        api_secret=api_secret,
+        charts_path=charts_path,
+        include_charts=include_charts,
+        chart_generator_cls=chart_generator_cls,
+    )
+    ai_context = write_outputs(context, context_path, report_path)
+    if args.include_summary:
+        summary_path = write_summary_output(context, context_path)
+        with context_path.open("w", encoding="utf-8") as f:
+            ai_context["summary_files"] = {"overview": str(summary_path.resolve())}
+            json.dump(ai_context, f, ensure_ascii=False, indent=2)
+    logger.info("context written to %s", context_path)
+    logger.info("report written to %s", report_path)
+    if args.include_summary:
+        logger.info("overview summary written to %s", summary_path)
+    if context.get("chart_files"):
+        logger.info("charts:")
+        for timeframe, file_path in context["chart_files"].items():
+            logger.info("  %s: %s", timeframe, file_path)
+
+    if args.auto_analyze:
+        openai_key = _sanitize_env_credential(os.getenv(OPENAI_API_KEY_ENV))
+        if not openai_key:
+            logger.error("--auto-analyze requires %s to be set", OPENAI_API_KEY_ENV)
+            return 1
+        logger.info("sending prompt to %s for analysis...", args.ai_model)
+        prompt_text = report_path.read_text(encoding="utf-8")
+        analysis = _run_ai_analysis(openai_key, args.ai_model, prompt_text)
+        analysis_path = _resolve_analysis_path(context_path)
+        analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        analysis_path.write_text(analysis, encoding="utf-8")
+        logger.info("AI analysis written to %s", analysis_path)
+        print("\n" + "=" * 60)
+        print(analysis)
+        print("=" * 60)
+
+    return 0
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    # indicate which Python interpreter is running; helps avoid mismatched envs
-    print(f"[info] running under Python executable: {sys.executable}")
+    _setup_logging()
+    logger.info("running under Python executable: %s", sys.executable)
     args = parse_args(argv if argv is not None else sys.argv[1:])
     _load_local_env_file(Path(__file__).resolve().parent / ".env.local")
 
-    try:
-        timeframes = _parse_timeframes(args.timeframes)
-        if args.kline_limit <= 0:
-            raise ValueError("kline-limit must be greater than 0")
-        if args.depth_limit <= 0:
-            raise ValueError("depth-limit must be greater than 0")
-        if args.agg_trades_limit <= 0:
-            raise ValueError("agg-trades-limit must be greater than 0")
-        if not 0 <= args.large_trade_quantile <= 1:
-            raise ValueError("large-trade-quantile must be between 0 and 1")
-        if args.oi_limit <= 0:
-            raise ValueError("oi-limit must be greater than 0")
-        if args.long_short_limit <= 0:
-            raise ValueError("long-short-limit must be greater than 0")
-        if args.orderbook_dynamic_samples <= 0:
-            raise ValueError("orderbook-dynamic-samples must be greater than 0")
-        if args.orderbook_dynamic_interval < 0:
-            raise ValueError("orderbook-dynamic-interval must be >= 0")
-        if args.volume_profile_window <= 0:
-            raise ValueError("volume-profile-window must be greater than 0")
-        if args.volume_profile_bins <= 0:
-            raise ValueError("volume-profile-bins must be greater than 0")
-        if args.include_account and args.no_account:
-            raise ValueError("include-account and no-account cannot both be set")
+    watch_interval = max(0, args.watch)
+    iteration = 0
+    while True:
+        iteration += 1
+        if watch_interval:
+            logger.info("=" * 20 + " iteration #%d " + "=" * 20, iteration)
+        try:
+            rc = _run_once(args)
+            if rc != 0 and not watch_interval:
+                return rc
+        except Exception as exc:
+            logger.error("failed to build market context: %s", exc)
+            if not watch_interval:
+                return 1
 
-        context_path, report_path, charts_path = _resolve_output_files(
-            args.context_file,
-            args.report_file,
-            args.chart_dir,
-        )
+        if not watch_interval:
+            return 0
 
-        api_key = _sanitize_env_credential(os.getenv(BINANCE_API_KEY_ENV))
-        api_secret = _sanitize_env_credential(os.getenv(BINANCE_API_SECRET_ENV))
-        if _looks_like_placeholder_credential(api_key) or _looks_like_placeholder_credential(api_secret):
-            print(
-                f"warning: detected placeholder {BINANCE_API_KEY_ENV}/{BINANCE_API_SECRET_ENV}; "
-                "account position collection disabled",
-                file=sys.stderr,
-            )
-            api_key = None
-            api_secret = None
-        has_api_credentials = bool(api_key and api_secret)
-        include_account = not args.no_account and (args.include_account or has_api_credentials)
-        if include_account and (not api_key or not api_secret):
-            print(
-                f"warning: account collection enabled but usable {BINANCE_API_KEY_ENV}/{BINANCE_API_SECRET_ENV} "
-                "not found; account position data will be unavailable",
-                file=sys.stderr,
-            )
-
-        chart_generator_cls = None
-        chart_warning = None
-        include_charts = not args.no_charts
-        if include_charts:
-            chart_generator_cls, chart_warning = _load_chart_generator()
-            if chart_generator_cls is None:
-                include_charts = False
-                print(f"warning: {chart_warning}", file=sys.stderr)
-
-        context = build_market_context(
-            symbol=args.symbol,
-            timeframes=timeframes,
-            kline_limit=args.kline_limit,
-            depth_limit=args.depth_limit,
-            agg_trades_limit=args.agg_trades_limit,
-            large_trade_quantile=args.large_trade_quantile,
-            oi_period=args.oi_period,
-            oi_limit=args.oi_limit,
-            long_short_period=args.long_short_period,
-            long_short_limit=args.long_short_limit,
-            orderbook_dynamic_samples=args.orderbook_dynamic_samples,
-            orderbook_dynamic_interval=args.orderbook_dynamic_interval,
-            volume_profile_window=args.volume_profile_window,
-            volume_profile_bins=args.volume_profile_bins,
-            include_account=include_account,
-            api_key=api_key,
-            api_secret=api_secret,
-            charts_path=charts_path,
-            include_charts=include_charts,
-            chart_generator_cls=chart_generator_cls,
-        )
-        ai_context = write_outputs(context, context_path, report_path)
-        if args.include_summary:
-            summary_path = write_summary_output(context, context_path)
-            with context_path.open("w", encoding="utf-8") as f:
-                ai_context["summary_files"] = {"overview": str(summary_path.resolve())}
-                json.dump(ai_context, f, ensure_ascii=False, indent=2)
-        print(f"context written to {context_path}")
-        print(f"report written to {report_path}")
-        if args.include_summary:
-            print(f"overview summary written to {summary_path}")
-        if context.get("chart_files"):
-            print("charts:")
-            for timeframe, file_path in context["chart_files"].items():
-                print(f"  {timeframe}: {file_path}")
-        return 0
-    except Exception as exc:
-        print(f"failed to build market context: {exc}", file=sys.stderr)
-        return 1
+        logger.info("[watch] sleeping %ds until next run... (Ctrl+C to stop)", watch_interval)
+        try:
+            time.sleep(watch_interval)
+        except KeyboardInterrupt:
+            logger.info("[watch] stopped by user")
+            return 0
 
 
 if __name__ == "__main__":

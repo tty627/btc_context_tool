@@ -119,6 +119,81 @@ class IndicatorEngine:
             return "oversold"
         return "neutral"
 
+    def calculate_atr(
+        self,
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        period: int = 14,
+    ) -> Dict[str, float]:
+        """Average True Range — used for stop-loss sizing and position management."""
+        if not highs or len(highs) != len(lows) or len(highs) != len(closes):
+            return {"atr": 0.0, "atr_pct": 0.0}
+
+        true_ranges: List[float] = [highs[0] - lows[0]]
+        for i in range(1, len(closes)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            true_ranges.append(tr)
+
+        if len(true_ranges) <= period:
+            atr = sum(true_ranges) / len(true_ranges)
+        else:
+            atr = sum(true_ranges[:period]) / period
+            for tr in true_ranges[period:]:
+                atr = (atr * (period - 1) + tr) / period
+
+        current_price = closes[-1] if closes else 1.0
+        atr_pct = (atr / current_price * 100) if current_price else 0.0
+        return {
+            "atr": round(atr, 6),
+            "atr_pct": round(atr_pct, 6),
+            "suggested_sl_distance": round(atr * 1.5, 6),
+            "suggested_sl_pct": round(atr_pct * 1.5, 6),
+        }
+
+    def calculate_bollinger_bands(
+        self,
+        closes: List[float],
+        period: int = 20,
+        num_std: float = 2.0,
+    ) -> Dict[str, float]:
+        """Bollinger Bands — volatility channel for squeeze/breakout detection."""
+        if len(closes) < period:
+            mid = sum(closes) / len(closes) if closes else 0.0
+            return {"upper": mid, "middle": mid, "lower": mid, "bandwidth": 0.0, "percent_b": 0.5}
+
+        window = closes[-period:]
+        mid = sum(window) / period
+        variance = sum((x - mid) ** 2 for x in window) / period
+        std = variance ** 0.5
+        upper = mid + num_std * std
+        lower = mid - num_std * std
+        bandwidth = ((upper - lower) / mid * 100) if mid else 0.0
+        percent_b = ((closes[-1] - lower) / (upper - lower)) if (upper - lower) else 0.5
+
+        return {
+            "upper": round(upper, 6),
+            "middle": round(mid, 6),
+            "lower": round(lower, 6),
+            "bandwidth": round(bandwidth, 6),
+            "percent_b": round(percent_b, 6),
+        }
+
+    def calculate_vwap(self, candles: List[Dict]) -> float:
+        """Volume-Weighted Average Price from candle data."""
+        total_vp = 0.0
+        total_vol = 0.0
+        for c in candles:
+            typical = (c["high"] + c["low"] + c["close"]) / 3
+            vol = c.get("volume", 0.0)
+            total_vp += typical * vol
+            total_vol += vol
+        return round(total_vp / total_vol, 6) if total_vol else 0.0
+
     def calculate_for_candles(self, candles: List[Dict]) -> Dict:
         if not candles:
             raise ValueError("candles cannot be empty")
@@ -145,4 +220,7 @@ class IndicatorEngine:
                 "state": self.classify_rsi(rsi_last),
                 "divergence": rsi_divergence,
             },
+            "atr": self.calculate_atr(highs, lows, closes),
+            "bollinger": self.calculate_bollinger_bands(closes),
+            "vwap": self.calculate_vwap(candles),
         }

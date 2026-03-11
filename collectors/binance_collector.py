@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -9,13 +10,25 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 try:
+    import httpx
+
+    _HAS_HTTPX = True
+except ImportError:
+    _HAS_HTTPX = False
+
+try:
     from ..config import BASE_URL, REQUEST_TIMEOUT
 except ImportError:
     from config import BASE_URL, REQUEST_TIMEOUT
 
+logger = logging.getLogger("btc_context.collector")
+
 
 class BinanceFuturesCollector:
-    """Collect market data from Binance USDT-M Futures REST APIs."""
+    """Collect market data from Binance USDT-M Futures REST APIs.
+
+    Uses httpx with connection pooling when available; falls back to urllib.
+    """
 
     def __init__(
         self,
@@ -28,6 +41,13 @@ class BinanceFuturesCollector:
         self.timeout = timeout
         self.api_key = self._sanitize_credential(api_key)
         self.api_secret = self._sanitize_credential(api_secret)
+        self._httpx_client: Optional[Any] = None
+        if _HAS_HTTPX:
+            self._httpx_client = httpx.Client(
+                timeout=httpx.Timeout(timeout, connect=5.0),
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
 
     @staticmethod
     def _sanitize_credential(value: Optional[str]) -> str:
@@ -54,55 +74,16 @@ class BinanceFuturesCollector:
         return body
 
     def _get_json(self, path: str, params: Dict[str, str]) -> Any:
-        """Fetch JSON from a Binance REST endpoint with simple retry logic.
+        """Fetch JSON from a Binance REST endpoint with retry logic.
 
-        Network edges (SSL resets, transient TCP errors) are a fact of life when
-        talking to Binance's public API.  Previously a single failure would
-        cause the entire script to abort, which made the tool brittle.  We now
-        retry a few times with a short back‑off before giving up.  The retries
-        apply only to *connection* errors (URLError); HTTP errors are still
-        raised immediately since they indicate a bad request.
+        Uses httpx (connection pooling) when available, falls back to urllib.
         """
-        query = urlencode(params)
-        url = f"{self.base_url}{path}?{query}"
-
-        # retry parameters
-        max_attempts = 3
-        delay = 1.0  # seconds, will grow if we retry
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with urlopen(url, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except HTTPError as exc:
-                # server returned a non-200 status; no point retrying
-                raise RuntimeError(f"Binance API HTTP {exc.code} for {path}: {exc.reason}") from exc
-            except URLError as exc:
-                # connection-level error; maybe temporary
-                if attempt == max_attempts:
-                    raise RuntimeError(f"Binance API connection error for {path}: {exc.reason}") from exc
-                # otherwise wait and retry
-                time.sleep(delay)
-                delay *= 2
-                continue
+        url = f"{self.base_url}{path}"
+        return self._request_with_retry(url, params=params, label=path)
 
     def _get_json_url(self, url: str) -> Any:
         """Fetch JSON from an absolute URL with retry logic."""
-        max_attempts = 3
-        delay = 1.0
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with urlopen(url, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except HTTPError as exc:
-                raise RuntimeError(f"HTTP {exc.code} for {url}: {exc.reason}") from exc
-            except URLError as exc:
-                if attempt == max_attempts:
-                    raise RuntimeError(f"connection error for {url}: {exc.reason}") from exc
-                time.sleep(delay)
-                delay *= 2
-                continue
+        return self._request_with_retry(url, params=None, label=url)
 
     def _signed_get_json(self, path: str, params: Dict[str, str]) -> Any:
         """Fetch signed JSON from a private Binance endpoint."""
@@ -118,29 +99,65 @@ class BinanceFuturesCollector:
             query.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        url = f"{self.base_url}{path}?{query}&signature={signature}"
-        request = Request(url, headers={"X-MBX-APIKEY": self.api_key})
+        signed_params["signature"] = signature
+        url = f"{self.base_url}{path}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        return self._request_with_retry(url, params=signed_params, headers=headers, label=f"private:{path}")
 
-        max_attempts = 3
+    def _request_with_retry(
+        self,
+        url: str,
+        params: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        label: str = "",
+        max_attempts: int = 3,
+    ) -> Any:
         delay = 1.0
-
         for attempt in range(1, max_attempts + 1):
             try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except HTTPError as exc:
-                try:
-                    body = exc.read().decode("utf-8")
-                except Exception:
-                    body = str(exc.reason)
-                details = self._format_binance_error(body)
-                raise RuntimeError(f"Binance private API HTTP {exc.code} for {path}: {details}") from exc
-            except URLError as exc:
+                if self._httpx_client is not None:
+                    return self._httpx_get(url, params, headers)
+                return self._urllib_get(url, params, headers)
+            except RuntimeError:
+                raise
+            except Exception as exc:
                 if attempt == max_attempts:
-                    raise RuntimeError(f"Binance private API connection error for {path}: {exc.reason}") from exc
+                    raise RuntimeError(f"connection error for {label}: {exc}") from exc
+                logger.debug("retry %d/%d for %s: %s", attempt, max_attempts, label, exc)
                 time.sleep(delay)
                 delay *= 2
-                continue
+
+    def _httpx_get(
+        self,
+        url: str,
+        params: Optional[Dict[str, str]],
+        headers: Optional[Dict[str, str]],
+    ) -> Any:
+        resp = self._httpx_client.get(url, params=params, headers=headers)
+        if resp.status_code >= 400:
+            details = self._format_binance_error(resp.text)
+            raise RuntimeError(f"HTTP {resp.status_code} for {url}: {details}")
+        return resp.json()
+
+    def _urllib_get(
+        self,
+        url: str,
+        params: Optional[Dict[str, str]],
+        headers: Optional[Dict[str, str]],
+    ) -> Any:
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        request = Request(url, headers=headers or {})
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8")
+            except Exception:
+                body = str(exc.reason)
+            details = self._format_binance_error(body)
+            raise RuntimeError(f"HTTP {exc.code} for {url}: {details}") from exc
 
     @staticmethod
     def _with_account_hint(reason: str) -> str:
