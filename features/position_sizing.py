@@ -93,11 +93,14 @@ class PositionSizingMixin(FeatureBase):
         current_price: float,
         indicators_by_timeframe: Dict,
         account_positions: Optional[Dict] = None,
-        risk_pct: float = 1.0,
-        leverage: int = 10,
+        risk_pct: float = 2.0,
+        leverage: int = 25,
     ) -> Dict:
-        """Build position sizing data from the best available ATR timeframe."""
-        for tf in ("15m", "1h", "4h"):
+        """Build position sizing data from the best available ATR timeframe.
+
+        Prefers 1h ATR for 4h swing trading style.
+        """
+        for tf in ("1h", "4h", "15m"):
             atr = indicators_by_timeframe.get(tf, {}).get("atr", {})
             if atr.get("atr", 0.0) > 0:
                 sizing = cls.calculate_position_size(

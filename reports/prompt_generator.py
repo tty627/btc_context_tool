@@ -5,23 +5,40 @@ class PromptGenerator:
     """Build a concise BTC trading prompt from market context."""
 
     SYSTEM_PROMPT = (
-        "你是 BTC 永续合约交易助手。基于下方数据，给出极简交易计划。\n"
-        "规则：以挂单为主，不追单。结构不清或盈亏比差就观望。不要反问。不要废话。"
+        "你是 BTC 永续合约交易助手。基于下方数据，给出可执行的 4h 波段交易计划。\n"
+        "规则：\n"
+        "- 以分批挂单为主，不追市价单\n"
+        "- 目标持仓几小时到半天，目标盈利 2-5%\n"
+        "- 杠杆范围 20-50x，仓位用账户百分比表示\n"
+        "- 结构不清或盈亏比低于 1.5:1 就建议观望\n"
+        "- 不要反问，不要教学，不要免责声明\n"
+        "- 若有持仓数据，必须给出持仓操作建议"
     )
 
     OUTPUT_FORMAT = (
-        "严格按以下格式输出，不要加额外段落：\n"
+        "严格按以下格式输出：\n"
         "\n"
         "【方向】做多 / 做空 / 观望\n"
-        "【市场状态】趋势上涨 / 趋势下跌 / 震荡 / 修正\n"
-        "【信号强度】强 / 中 / 弱（参考下方评分）\n"
-        "【挂单价】具体价格或价格区间\n"
-        "【止损】价格\n"
-        "【止盈】TP1=价格, TP2=价格\n"
-        "【等待时间】大致窗口（如 15-30min / 1-3h）\n"
-        "【一句话理由】为什么这样做，20字以内\n"
+        "【市场状态】趋势 / 震荡 / 修正\n"
+        "【信号强度】强 / 中 / 弱\n"
         "\n"
-        "若观望，挂单价/止损/止盈写「无」，理由写为什么不做。"
+        "【分批挂单】\n"
+        "  第1档: 价格=xxx, 仓位=账户xx%\n"
+        "  第2档: 价格=xxx, 仓位=账户xx%\n"
+        "  (可选第3档)\n"
+        "【止损】价格\n"
+        "【止盈】TP1=价格(约x%), TP2=价格(约x%)\n"
+        "【预计等待】大致窗口\n"
+        "\n"
+        "【持仓建议】\n"
+        "  当前状态: 多/空/空仓\n"
+        "  操作: 持有/加仓/减仓x%/移动止损到xxx/平仓\n"
+        "  平仓信号: 什么条件下平仓\n"
+        "\n"
+        "【理由】3-5行，包含：趋势配合、关键位、流动性方向、主要风险\n"
+        "\n"
+        "若观望，挂单写「无」，理由写为什么不做。\n"
+        "持仓建议必须写，空仓也要写「当前空仓，等待入场」。"
     )
 
     def build(self, context: Dict) -> str:
@@ -41,12 +58,13 @@ class PromptGenerator:
         lines.extend(self._build_derivatives_compact(context))
         lines.append("")
         lines.extend(self._build_sizing(context))
+        lines.append("")
+        lines.extend(self._build_position_status(context))
 
         return "\n".join(lines).strip()
 
     @staticmethod
     def _build_snapshot(ctx: Dict) -> list[str]:
-        """Top-level snapshot: price, score, session, key levels."""
         price = ctx.get("price", 0)
         signal = ctx.get("signal_score", {})
         session = ctx.get("session_context", {})
@@ -59,10 +77,7 @@ class PromptGenerator:
         bias = signal.get("bias", "?")
         strength = signal.get("strength", "?")
 
-        trend_parts = []
-        for tf in ("4h", "1h", "15m"):
-            t = structure.get(tf, "?")
-            trend_parts.append(f"{tf}={t}")
+        trend_parts = [f"{tf}={structure.get(tf, '?')}" for tf in ("4h", "1h", "15m")]
 
         lines = [
             "=== 快照 ===",
@@ -82,7 +97,6 @@ class PromptGenerator:
 
     @staticmethod
     def _build_technicals(ctx: Dict) -> list[str]:
-        """Per-timeframe technicals: compact one-liner per TF."""
         lines = ["=== 技术指标 ==="]
         for tf, m in ctx.get("timeframes", {}).items():
             feat = m.get("features", {})
@@ -92,19 +106,11 @@ class PromptGenerator:
             macd = m.get("macd", {})
             bb = m.get("bollinger", {})
 
-            trend = feat.get("trend", "?")
-            mom = feat.get("momentum", "?")
-            rsi_val = rsi.get("14", "?")
-            rsi_st = rsi.get("state", "")
-            div = rsi.get("divergence", "none")
-            atr_val = atr.get("atr", "?")
-            atr_pct = atr.get("atr_pct", "?")
-
             lines.append(
-                f"[{tf}] trend={trend} mom={mom} | "
-                f"RSI={rsi_val}({rsi_st}) div={div} | "
+                f"[{tf}] trend={feat.get('trend', '?')} mom={feat.get('momentum', '?')} | "
+                f"RSI={rsi.get('14', '?')}({rsi.get('state', '')}) div={rsi.get('divergence', 'none')} | "
                 f"MACD_hist={macd.get('hist', '?')} | "
-                f"ATR={atr_val}({atr_pct}%) | "
+                f"ATR={atr.get('atr', '?')}({atr.get('atr_pct', '?')}%) | "
                 f"BB%B={bb.get('percent_b', '?')} bw={bb.get('bandwidth', '?')} | "
                 f"EMA7={ema.get('7')} E25={ema.get('25')} E99={ema.get('99')}"
             )
@@ -117,7 +123,6 @@ class PromptGenerator:
 
     @staticmethod
     def _build_microstructure(ctx: Dict) -> list[str]:
-        """Orderbook + trade flow: the short-term pressure signals."""
         lines = ["=== 盘口与成交流 ==="]
 
         ob = ctx.get("orderbook", {})
@@ -167,7 +172,7 @@ class PromptGenerator:
             lines.append("近端流动性:")
             for z in near_zones:
                 lines.append(
-                    f"  {str(z.get('name','')).replace('_',' ')}: "
+                    f"  {str(z.get('name', '')).replace('_', ' ')}: "
                     f"{z.get('zone_low')}-{z.get('zone_high')} "
                     f"({z.get('estimated_pressure', '?')})"
                 )
@@ -176,7 +181,6 @@ class PromptGenerator:
 
     @staticmethod
     def _build_derivatives_compact(ctx: Dict) -> list[str]:
-        """Funding, OI, long/short ratio, basis — one block."""
         lines = ["=== 衍生品 ==="]
 
         funding = ctx.get("funding", {})
@@ -221,7 +225,6 @@ class PromptGenerator:
 
     @staticmethod
     def _build_sizing(ctx: Dict) -> list[str]:
-        """Position sizing reference."""
         sizing = ctx.get("position_sizing", {})
         if not sizing or not sizing.get("available"):
             return []
@@ -230,7 +233,36 @@ class PromptGenerator:
         sr = ref.get("short", {})
         return [
             "=== ATR仓位参考 ===",
-            f"ATR({sizing.get('atr_timeframe')})={sizing.get('atr')} SL距离={sizing.get('sl_distance')}",
+            f"ATR({sizing.get('atr_timeframe')})={sizing.get('atr')} SL距离={sizing.get('sl_distance')} SL%={sizing.get('sl_pct')}",
             f"做多: SL={lr.get('stop_loss')} TP1={lr.get('tp1')} TP2={lr.get('tp2')}",
             f"做空: SL={sr.get('stop_loss')} TP1={sr.get('tp1')} TP2={sr.get('tp2')}",
+        ]
+
+    @staticmethod
+    def _build_position_status(ctx: Dict) -> list[str]:
+        acc = ctx.get("account_positions", {})
+        if not acc.get("available"):
+            return ["=== 持仓 ===", "仓位数据不可用，按空仓处理"]
+
+        sym = acc.get("symbol_position")
+        active_count = acc.get("active_positions_count", 0)
+
+        if not sym or abs(float(sym.get("position_amt", 0))) == 0:
+            return ["=== 持仓 ===", "当前空仓"]
+
+        side = sym.get("side", "?")
+        amt = sym.get("position_amt", 0)
+        entry = sym.get("entry_price", 0)
+        mark = sym.get("mark_price", 0)
+        liq = sym.get("liquidation_price", 0)
+        pnl = sym.get("unrealized_pnl", 0)
+        lev = sym.get("leverage", 0)
+        notional = abs(float(sym.get("notional", 0)))
+
+        return [
+            "=== 持仓 ===",
+            f"方向={side} 数量={amt} 杠杆={lev}x",
+            f"开仓价={entry} 标记价={mark} 强平价={liq}",
+            f"持仓价值={notional:.2f}U 未实现盈亏={pnl}",
+            f"（AI 必须基于此持仓给出：持有/加仓/减仓/调止损/平仓建议）",
         ]
