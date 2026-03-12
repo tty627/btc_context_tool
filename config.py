@@ -28,6 +28,7 @@ AI_ANALYSIS_FILE = OUTPUT_DIR / "btc_ai_analysis.md"
 
 CHART_BARS = {
     "4h": 120,
+    "1h": 120,
     "15m": 120,
     "5m": 120,
 }
@@ -43,3 +44,8 @@ ORDERBOOK_DYNAMIC_SAMPLES = 30
 ORDERBOOK_DYNAMIC_INTERVAL = 0.2
 VOLUME_PROFILE_WINDOW = 72
 VOLUME_PROFILE_BINS = 24
+
+# Report generation mode:
+#   "raw_first"  — main report contains only raw facts (default, recommended for LLM input)
+#   "full_debug" — appends derived/hypothesis/score fields after the main report
+REPORT_MODE = "raw_first"

@@ -12,6 +12,7 @@ from .orderbook import OrderbookMixin
 from .position_sizing import PositionSizingMixin
 from .session import SessionMixin
 from .signal_score import SignalScoreMixin
+from .spot_perp import SpotPerpMixin
 from .technical import TechnicalMixin
 from .trade_flow import TradeFlowMixin
 from .volume import VolumeMixin
@@ -28,6 +29,7 @@ class FeatureExtractor(
     DeploymentMixin,
     PositionSizingMixin,
     SignalScoreMixin,
+    SpotPerpMixin,
 ):
     """All feature-extraction capabilities composed via mixins.
 

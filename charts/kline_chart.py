@@ -124,6 +124,16 @@ class KlineChartGenerator:
                 "label_limit": 6,
                 "show_trade_clusters": False,
             }
+        if timeframe == "1h":
+            return {
+                "mode": "transition",
+                "title": "1H",
+                "oi_period": "15m",
+                "show_micro": False,
+                "show_plan": False,
+                "label_limit": 6,
+                "show_trade_clusters": False,
+            }
         if timeframe == "15m":
             return {
                 "mode": "transition",
@@ -489,6 +499,43 @@ class KlineChartGenerator:
         if lines_left or lines_right:
             ax.legend(lines_left + lines_right, labels_left + labels_right, loc="upper right", fontsize=7)
 
+    @staticmethod
+    def _plot_delta_panel(ax, candles: Sequence[Dict]) -> None:
+        """Draw per-bar taker buy/sell delta with running CVD overlay.
+
+        Uses taker_buy_base field from klines.  Falls back silently if the field
+        is absent (e.g. older cached candles without the field).
+        """
+        deltas: List[float] = []
+        for c in candles:
+            buy = float(c.get("taker_buy_base", 0))
+            total = float(c.get("volume", 0))
+            deltas.append(buy - (total - buy))
+
+        if not any(d != 0 for d in deltas):
+            ax.set_ylabel("Δ", fontsize=8)
+            return
+
+        colors = ["#0f9d58" if d >= 0 else "#d24c36" for d in deltas]
+        ax.bar(range(len(deltas)), deltas, color=colors, width=0.72, alpha=0.72)
+        ax.axhline(0, color="#888", linewidth=0.7, alpha=0.5)
+        ax.set_ylabel("Δ BTC", fontsize=8)
+        ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.35)
+
+        running = 0.0
+        cvd: List[float] = []
+        for d in deltas:
+            running += d
+            cvd.append(running)
+        ax_cvd = ax.twinx()
+        ax_cvd.plot(range(len(cvd)), cvd, color="#8d6a9f", linewidth=1.3, label="CVD")
+        ax_cvd.set_ylabel("CVD", fontsize=8, color="#8d6a9f")
+        ax_cvd.tick_params(axis="y", labelsize=7, colors="#8d6a9f")
+        lines_l, labels_l = ax.get_legend_handles_labels()
+        lines_r, labels_r = ax_cvd.get_legend_handles_labels()
+        if lines_r:
+            ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper right", fontsize=7)
+
     def _plot_volume_panel(self, ax, candles: Sequence[Dict]) -> None:
         for idx, row in enumerate(candles):
             color = "#0f9d58" if row["close"] >= row["open"] else "#d24c36"
@@ -531,7 +578,11 @@ class KlineChartGenerator:
         self._plot_price_panel(axes_list[0], candles, timeframe, context, spec)
         self._plot_derivatives_panel(axes_list[1], candles, context, spec)
         if spec["show_micro"]:
-            self._plot_micro_panel(axes_list[2], candles, context)
+            has_taker = any(float(c.get("taker_buy_base", 0)) > 0 for c in candles)
+            if has_taker:
+                self._plot_delta_panel(axes_list[2], candles)
+            else:
+                self._plot_micro_panel(axes_list[2], candles, context)
             self._plot_volume_panel(axes_list[3], candles)
         else:
             self._plot_volume_panel(axes_list[2], candles)
@@ -539,3 +590,88 @@ class KlineChartGenerator:
         plt.tight_layout()
         fig.savefig(output_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
+
+    def generate_spot_perp_chart(
+        self,
+        symbol: str,
+        perp_klines: Sequence[Dict],
+        spot_klines: Sequence[Dict],
+        output_path: Path,
+    ) -> str | None:
+        """Generate a spot vs perp comparison chart (1h).
+
+        Three panels: dual price (perp K-lines + spot close), basis bps bars, volume.
+        Returns resolved output path or None if insufficient data.
+        """
+        if not perp_klines or not spot_klines:
+            return None
+
+        perp_sorted = sorted(perp_klines, key=lambda x: x["open_time"])[-120:]
+        spot_lookup: Dict[int, float] = {
+            c["open_time"]: float(c["close"])
+            for c in spot_klines
+        }
+
+        aligned = [c for c in perp_sorted if c["open_time"] in spot_lookup]
+        if len(aligned) < 10:
+            aligned = perp_sorted
+
+        spot_closes = [spot_lookup.get(c["open_time"], 0.0) for c in aligned]
+        basis_bps = [
+            (c["close"] - s) / s * 10000 if s > 0 else 0.0
+            for c, s in zip(aligned, spot_closes)
+        ]
+
+        fig, axes = plt.subplots(
+            3, 1, figsize=(15, 9), sharex=True,
+            gridspec_kw={"height_ratios": [5, 1.5, 1.0]},
+        )
+        fig.patch.set_facecolor("#f8f5f0")
+        for axis in axes:
+            axis.set_facecolor("#fffdf8")
+
+        ax_price = axes[0]
+        body_floor = max((max(c["high"] for c in aligned) - min(c["low"] for c in aligned)) * 0.001, 0.5)
+        for idx, row in enumerate(aligned):
+            color = "#0f9d58" if row["close"] >= row["open"] else "#d24c36"
+            ax_price.vlines(idx, row["low"], row["high"], color=color, linewidth=1.0, alpha=0.8)
+            lower = min(row["open"], row["close"])
+            height = max(abs(row["close"] - row["open"]), body_floor)
+            ax_price.add_patch(
+                Rectangle((idx - 0.3, lower), 0.6, height, facecolor=color, edgecolor=color, linewidth=0.7, alpha=0.85)
+            )
+        valid_pairs = [(i, s) for i, s in enumerate(spot_closes) if s > 0]
+        if valid_pairs:
+            xs, ys = zip(*valid_pairs)
+            ax_price.plot(list(xs), list(ys), color="#457b9d", linewidth=1.6, linestyle="--", label="Spot", alpha=0.9)
+        ax_price.set_title(f"{symbol} Spot vs Perp (1H)", fontsize=12, pad=10)
+        ax_price.grid(True, linestyle=":", linewidth=0.5, alpha=0.45)
+        ax_price.legend(loc="upper left", fontsize=8)
+        ax_price.set_xlim(-1, len(aligned) + 2)
+
+        ax_basis = axes[1]
+        basis_colors = ["#0f9d58" if b >= 0 else "#d24c36" for b in basis_bps]
+        ax_basis.bar(range(len(basis_bps)), basis_bps, color=basis_colors, width=0.72, alpha=0.7)
+        ax_basis.axhline(0, color="#888", linewidth=0.8)
+        ax_basis.set_ylabel("Basis bps", fontsize=8)
+        ax_basis.grid(True, linestyle=":", linewidth=0.5, alpha=0.35)
+
+        ax_vol = axes[2]
+        for idx, row in enumerate(aligned):
+            color = "#0f9d58" if row["close"] >= row["open"] else "#d24c36"
+            ax_vol.bar(idx, row.get("volume", 0), color=color, width=0.66, alpha=0.55)
+        ax_vol.set_ylabel("Perp Vol", fontsize=8)
+        ax_vol.grid(True, linestyle=":", linewidth=0.5, alpha=0.3)
+        tick_count = min(8, len(aligned))
+        step = max(1, len(aligned) // max(1, tick_count - 1))
+        ticks = list(range(0, len(aligned), step))
+        if ticks and ticks[-1] != len(aligned) - 1:
+            ticks.append(len(aligned) - 1)
+        ax_vol.set_xticks(ticks)
+        ax_vol.set_xticklabels([self._format_time(int(aligned[i]["open_time"])) for i in ticks], fontsize=8)
+
+        plt.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        return str(output_path.resolve())
