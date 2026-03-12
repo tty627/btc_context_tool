@@ -1,16 +1,31 @@
-"""BTC execution-grade chart generator.
+"""BTC structural-context chart generator.
 
-Design principles
+Design philosophy
 ─────────────────
-• Three-tier level hierarchy: primary (thick solid) → secondary (thin dashed)
-  → tertiary (dotted, dim).  Same object = same colour across all charts.
-• Zone-box mechanism: levels within 0.2 % of each other are merged into a
-  shaded rectangle with a single label to prevent right-axis clutter.
-• Execution overlay (15m / 5m only): position management lines
-  (Entry / BE / SL / T0 / T1 / T2) and action lines
-  (Hold above / Reduce near / Add above / Invalidate below).
-• OI-state badge and Spot/Perp state badge on every price panel.
-• Colour semantics are defined once in _CLR and _TIER at module level.
+Charts are structural-context aids for a downstream AI, NOT decision panels.
+• Show WHERE price is (structure, zones, key levels).
+• Do NOT show WHAT to do (no action labels, no OI/S-P badges, no trade advice).
+• Keep text labels minimal: object name + price tier only (POC, HVN2, 4H High …).
+• The AI reads btc_context.json / btc_report.txt for indicator values and flow data;
+  charts supply the spatial / visual context that text cannot replicate.
+
+Three-tier level hierarchy
+──────────────────────────
+• Primary   (tier 1): thick solid line, bright — 4H range, POC
+• Secondary (tier 2): thin dashed — HVN, AVWAP
+• Tertiary  (tier 3): dotted, dim — LVN, minor pivots
+
+Zone-box mechanism
+──────────────────
+• Nearby levels (within 0.2 % / $10) are merged into a shaded rectangle
+  with a single merged label.  Reduces right-axis clutter.
+
+position_overlay switch (default False)
+────────────────────────────────────────
+• False (default): clean structural chart, no position context drawn.
+• True: draws Entry / BE / SL / Liq / T0 / T1 / T2 from account_positions
+  and position_sizing.  Useful for manual review; disabled by default so
+  that position anchoring does not influence AI structural reading.
 """
 
 from datetime import datetime, timezone
@@ -42,12 +57,7 @@ _CLR = {
     "t0":            "#e6ac00",   # amber   — reduce / breakeven zone
     "t1":            "#5dbbdb",   # sky     — structure target
     "t2":            "#01c853",   # lime    — extension target
-    # execution action lines
-    "hold":          "#2ecc40",
-    "reduce":        "#ff851b",
-    "add":           "#0074d9",
-    "invalidate":    "#ff4136",
-    # micro structure
+    # micro structure zones (5m)
     "cluster":       "#5c677d",
     "absorption":    "#2a9d8f",
 }
@@ -273,46 +283,9 @@ class KlineChartGenerator:
                 lines.append({"label": "T2",  "price": tp2, "style": "t2"})
         return lines
 
-    @staticmethod
-    def _get_action_lines(
-        levels: List[Dict],
-        current_price: float,
-    ) -> List[Dict]:
-        """Derive Hold / Reduce / Add / Invalidate action lines from key levels."""
-        if not levels or current_price <= 0:
-            return []
-        pri2 = [lv for lv in levels if int(lv.get("priority", 3)) <= 2]
-        supports    = sorted([lv for lv in pri2 if float(lv["price"]) < current_price],
-                             key=lambda x: float(x["price"]), reverse=True)
-        resistances = sorted([lv for lv in pri2 if float(lv["price"]) > current_price],
-                             key=lambda x: float(x["price"]))
-        actions: List[Dict] = []
-        if supports:
-            p = float(supports[0]["price"])
-            actions.append({"label": f"Hold > {p:.0f}", "price": p, "style": "hold"})
-            if len(supports) >= 2:
-                p2 = float(supports[1]["price"])
-                actions.append({"label": f"Invalidate < {p2:.0f}", "price": p2, "style": "invalidate"})
-        if resistances:
-            p = float(resistances[0]["price"])
-            actions.append({"label": f"Reduce @ {p:.0f}", "price": p, "style": "reduce"})
-            if len(resistances) >= 2:
-                p2 = float(resistances[1]["price"])
-                actions.append({"label": f"Add > {p2:.0f} accepted", "price": p2, "style": "add"})
-        return actions
-
-    def _draw_execution_overlay(
-        self,
-        ax,
-        context: Dict,
-        levels: List[Dict],
-        current_price: float,
-        timeframe: str,
-    ) -> None:
-        """Draw position management lines on all charts; action lines on 15m / 5m."""
-        # Position lines (Entry / BE / SL / T0 / T1 / T2)
-        pos_lines = self._get_position_lines(context)
-        for pl in pos_lines:
+    def _draw_position_lines(self, ax, context: Dict) -> None:
+        """Draw Entry / BE / SL / Liq / T0 / T1 / T2 lines (only when position_overlay=True)."""
+        for pl in self._get_position_lines(context):
             style = pl["style"]
             color = _CLR.get(style, "#888888")
             lw = 1.9 if style in ("sl", "entry") else 1.3
@@ -324,21 +297,6 @@ class KlineChartGenerator:
                 ha="left", va="center", fontsize=7.5, color=color, fontweight="bold",
                 bbox={"facecolor": "white", "edgecolor": color, "alpha": 0.90, "pad": 0.3},
                 zorder=6,
-            )
-
-        # Action lines (15m / 5m only)
-        if timeframe not in ("15m", "5m"):
-            return
-        for al in self._get_action_lines(levels, current_price):
-            style = al["style"]
-            color = _CLR.get(style, "#888888")
-            ax.axhline(al["price"], color=color, linewidth=1.2, linestyle="-.", alpha=0.68, zorder=4)
-            ax.text(
-                0.01, al["price"], al["label"],
-                transform=ax.get_yaxis_transform(),
-                ha="left", va="bottom", fontsize=6.5, color=color, fontstyle="italic",
-                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.60, "pad": 0.2},
-                zorder=5,
             )
 
     # ─── badge helpers ───────────────────────────────────────────────────────
@@ -514,19 +472,19 @@ class KlineChartGenerator:
         if timeframe == "4h":
             return {"mode": "structure",   "title": "4H Structure",
                     "oi_period": "1h",  "show_micro": False,
-                    "label_limit": 6,   "show_trade_clusters": False, "show_exec": True}
+                    "label_limit": 6,   "show_trade_clusters": False}
         if timeframe == "1h":
             return {"mode": "decision",    "title": "1H Decision",
                     "oi_period": "15m", "show_micro": False,
-                    "label_limit": 7,   "show_trade_clusters": False, "show_exec": True}
+                    "label_limit": 7,   "show_trade_clusters": False}
         if timeframe == "15m":
             return {"mode": "transition",  "title": "15m Transition",
                     "oi_period": "5m",  "show_micro": False,
-                    "label_limit": 7,   "show_trade_clusters": False, "show_exec": True}
+                    "label_limit": 7,   "show_trade_clusters": False}
         # 5m
-        return     {"mode": "execution",   "title": "5m Execution",
+        return     {"mode": "execution",   "title": "5m Execution Context",
                     "oi_period": "5m",  "show_micro": True,
-                    "label_limit": 5,   "show_trade_clusters": True,  "show_exec": True}
+                    "label_limit": 5,   "show_trade_clusters": True}
 
     # ─── line series helper ──────────────────────────────────────────────────
 
@@ -543,6 +501,7 @@ class KlineChartGenerator:
 
     def _plot_price_panel(
         self, ax, candles: Sequence[Dict], timeframe: str, context: Dict, spec: Dict,
+        position_overlay: bool = False,
     ) -> None:
         opens  = [r["open"]  for r in candles]
         highs  = [r["high"]  for r in candles]
@@ -603,21 +562,9 @@ class KlineChartGenerator:
                 if v > 0:
                     ax.axhline(v, color=color, linestyle=":", linewidth=0.8, alpha=0.50)
 
-        # Execution overlay (position + action lines)
-        if spec.get("show_exec"):
-            self._draw_execution_overlay(ax, context, ref_levels, current_price, timeframe)
-
-        # Badges
-        badges: List[Tuple[str, str]] = []
-        oi_badge = self._get_oi_badge(context, spec["oi_period"])
-        if oi_badge:
-            badges.append(oi_badge)
-        if timeframe in ("1h", "15m", "5m"):
-            sp_badge = self._get_spot_perp_badge(context)
-            if sp_badge:
-                badges.append(sp_badge)
-        badges.append((f"${current_price:,.1f}", "#e8f4f8"))
-        self._add_badges(ax, badges)
+        # Position management lines (only when explicitly requested)
+        if position_overlay:
+            self._draw_position_lines(ax, context)
 
         ax.set_title(
             f"{context.get('symbol', 'BTCUSDT')} {spec['title']}", fontsize=11, pad=8,
@@ -716,6 +663,7 @@ class KlineChartGenerator:
         candles: Sequence[Dict],
         output_path: Path,
         context: Dict,
+        position_overlay: bool = False,
     ) -> None:
         spec        = self._chart_spec(timeframe)
         panel_count = 4 if spec["show_micro"] else 3
@@ -731,7 +679,10 @@ class KlineChartGenerator:
         for a in axes_list:
             a.set_facecolor("#fffdf8")
 
-        self._plot_price_panel(axes_list[0], candles, timeframe, context, spec)
+        self._plot_price_panel(
+            axes_list[0], candles, timeframe, context, spec,
+            position_overlay=position_overlay,
+        )
         self._plot_derivatives_panel(axes_list[1], candles, context, spec)
         if spec["show_micro"]:
             has_taker = any(float(c.get("taker_buy_base", 0)) > 0 for c in candles)
@@ -754,7 +705,16 @@ class KlineChartGenerator:
         symbol: str,
         klines_by_timeframe: Dict[str, Sequence[Dict]],
         context: Dict | None = None,
+        position_overlay: bool = False,
     ) -> Dict[str, str]:
+        """Generate multi-timeframe charts.
+
+        Args:
+            position_overlay: When True, draws Entry / BE / SL / T0 / T1 / T2 lines
+                              derived from account_positions and position_sizing.
+                              Defaults to False — charts are kept clean for AI structural
+                              analysis without position-anchoring overlays.
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         chart_files: Dict[str, str] = {}
         for timeframe in self.bars_by_timeframe:
@@ -764,7 +724,10 @@ class KlineChartGenerator:
             bars   = min(len(candles), self.bars_by_timeframe[timeframe])
             window = candles[-bars:]
             path   = self.output_dir / f"{symbol}_{timeframe}.png"
-            self._plot_single(symbol, timeframe, window, path, context or {})
+            self._plot_single(
+                symbol, timeframe, window, path, context or {},
+                position_overlay=position_overlay,
+            )
             chart_files[timeframe] = str(path.resolve())
         return chart_files
 
@@ -814,23 +777,6 @@ class KlineChartGenerator:
             xs, ys = zip(*valid)
             ax_p.plot(list(xs), list(ys), color="#457b9d", linewidth=1.6,
                       linestyle="--", label="Spot", alpha=0.9)
-
-        # Spot/perp state badge (last 10 bars average)
-        recent_avg = sum(basis_bps[-10:]) / max(1, len(basis_bps[-10:]))
-        if recent_avg > 8:
-            bt, bc = "perp premium high",  "#fde3e3"
-        elif recent_avg > 3:
-            bt, bc = "perp mild premium",  "#fff3cd"
-        elif recent_avg < -8:
-            bt, bc = "perp discount high", "#fde3e3"
-        elif recent_avg < -3:
-            bt, bc = "perp mild discount", "#fff3cd"
-        else:
-            bt, bc = "near parity",        "#c8f7c5"
-        self._add_badges(ax_p, [
-            (bt, bc),
-            (f"basis(avg10) {recent_avg:+.1f}bps", "#e8f4f8"),
-        ])
 
         ax_p.set_title(f"{symbol} Spot vs Perp (1H)", fontsize=12, pad=10)
         ax_p.grid(True, linestyle=":", linewidth=0.5, alpha=0.45)
