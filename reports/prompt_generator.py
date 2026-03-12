@@ -185,6 +185,15 @@ wait_condition:
             sections.append("")
             sections += self._debug_appendix(context)
 
+        # Always append analysis instructions so the report is self-contained
+        # when pasted directly into any AI (ChatGPT web, Claude, etc.)
+        sections += [
+            "",
+            "─" * 60,
+            "=== ANALYSIS INSTRUCTIONS ===",
+            self.ANALYSIS_SYSTEM_PROMPT,
+        ]
+
         return "\n".join(sections).strip()
 
     # ─── 1. DATA QUALITY ────────────────────────────────────────────────────
