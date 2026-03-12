@@ -683,6 +683,13 @@ wait_condition:
         sym = acc.get("symbol_position")
         if not sym or abs(float(sym.get("position_amt", 0) or 0)) == 0:
             lines.append("has_open_position: false")
+            sizing = ctx.get("position_sizing", {})
+            if sizing and sizing.get("available"):
+                lines.append(
+                    f"ATR_ref: ATR({_v(sizing.get('atr_timeframe'))})={_f(sizing.get('atr'), 1)}  "
+                    f"1.5xATR_dist={_f(sizing.get('sl_distance'), 1)}  "
+                    f"ATR%={_f(sizing.get('sl_pct'), 3)}%"
+                )
             return lines
 
         notional = abs(float(sym.get("notional", 0) or 0))
