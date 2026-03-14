@@ -73,7 +73,7 @@ class PromptGenerator:
   硬规则：
   - 主结论必须优先围绕现有持仓：持有 / 减仓 / 加仓 / 平仓 / 反手
   - 不得把 fresh_long_setup / fresh_short_setup 作为主结论
-  - 【持仓处理】是主模块，必须先于【空仓视角的新计划】完整填写
+  - 【持仓处理】是主模块，必须先于【新计划】完整填写
   - 必须显式回答以下三问：
       a. 当前仓位是否仍符合 raw facts？（是 / 否 + 具体依据）
       b. 当前仓位的结构失效条件是什么？（必须含具体价位 + 触发行为）
@@ -82,16 +82,10 @@ class PromptGenerator:
       → 优先考虑 减仓 / 平仓 / 反手
       → 禁止以 deployment / bias / score 偏向为由继续强行"持有"
 
-  输出顺序（有仓位）：
-    【市场状态】→【证据记分板】→【当前动作】→【执行卡片】→【持仓处理】→【空仓视角的新计划】→【偏置审计】
-
 ▌ has_open_position = false 时：
-  - 主结论允许直接围绕 立即开多 / 立即开空 / 观望
-  - 【持仓处理】写 no_open_position，其余字段跳过
-  - 【空仓视角的新计划】升级为主模块
-
-  输出顺序（无仓位）：
-    【市场状态】→【证据记分板】→【当前动作】→【执行卡片】→【持仓处理（no_open_position）】→【空仓视角的新计划】→【偏置审计】
+  - 主结论围绕 立即开多 / 立即开空 / 观望
+  - 【持仓处理】仅写 no_open_position，其余字段跳过
+  - 【新计划】升级为主模块
 
 ════════════════════════════════════
 三阶段分析流程（必须按顺序执行，不得跳过）
@@ -100,181 +94,207 @@ class PromptGenerator:
 ▶ PHASE A — BLIND READ（仅基于 SECTION 1 + SECTION 2）
 ────────────────────────────────────
 A1. 多周期结构扫描（4h / 1h / 15m / 5m）
-    - 检查 EMA 排列 / MACD / RSI / KDJ / BB / VWAP 原始数值
-    - 各周期独立判断趋势方向（不看任何 bias / state 标签）
-    - 多周期不一致 → 禁止给 high confidence 趋势延续结论
+    - EMA 排列 / MACD / RSI / KDJ / BB / VWAP 原始数值
+    - 各周期独立判断方向（不看 bias / state 标签）
+    - 多周期不一致 → 禁止 high confidence
 
 A2. 关键价位定位
     - POC / HVN / LVN / AVWAP / 4H High / 4H Low / session high/low
-    - 确定当前价格相对关键位的位置
-    - 价格在 POC ± 0.5% 以内 / 区间中部 / 密集成交区 → 默认优先 wait，不追单
+    - 价格在 POC ± 0.5% / 区间中部 → 默认优先 wait
 
-A3. 微观结构读取（仅用原始数值，不用衍生标签）
-    - OI delta 数值 / OI 变化方向
-    - CVD / delta / aggressor layers 原始数值
-    - orderbook imbalance 数值 / wall 大小
-    - basis_bps 数值 / spot CVD 数值
-    - 结合 DATA_QUALITY 的质量约束（见下方）
+A3. 微观结构（仅用原始数值）
+    - OI delta / CVD / delta / aggressor layers / orderbook imbalance / basis_bps / spot CVD
+    - 结合 DATA_QUALITY 约束
 
-A4. 建立证据记分板（内部推理，结果写入【证据记分板】）
-    - bullish_evidence: 列举具体数值依据
-    - bearish_evidence: 列举具体数值依据
-    - quality_penalties: 数据质量降权项
-    - verdict: bull > bear by X / bear > bull by X / balanced
+A4. 建立证据记分板 → 写入【证据记分板】
 
 ▶ PHASE B — 弱参考核对（仅在 PHASE A 完成后）
 ────────────────────────────────────
-B1. 读取 SECTION 3 / SECTION 4（若存在），仅回答：
-    - 是否与 PHASE A 结论一致？
-    - 哪些 derived 字段可能带方向偏置？
-    - 若冲突 → 以 PHASE A 为准，derived signal 无效，记录入【偏置审计】
+读取 SECTION 3/4（若存在），仅判断是否与 PHASE A 冲突；
+若冲突 → 以 PHASE A 为准，记录入【偏置审计】。
 
 ▶ PHASE C — 最终决策
 ────────────────────────────────────
 C1. 基于 PHASE A + PHASE B 给出动作
-C2. 若 tradeability = low_edge / not_tradable → 主动输出 观望 / 不交易，不强行执行
-C3. long setup 和 short setup 必须对称输出（字段完全一致）
-C4. 若价格在区间中部 → fresh_long 和 fresh_short 的 confidence 不得高于 medium
+C2. tradeability = low_edge / not_tradable → 主动输出 观望 / 不交易
+C3. long/short setup 对称输出
+C4. 区间中部 → confidence 不得高于 medium
 
 ════════════════════════════════════
 数据质量硬约束
 ════════════════════════════════════
-- spoofing_risk 高或 wall 极短暂 → orderbook 仅作弱证据，不可单独决定方向
-- tradeflow coverage < 0.30（30%）→ 主动买卖盘方向结论降权，不可高置信度使用
-- 多周期方向冲突 → confidence 最高为 medium，禁止 high
-- price 在 POC ± 0.5% / 区间中部 → 默认 wait，不追单
-- derived signal 与 raw facts 冲突 → derived signal 无效
-- vol vs avg20 全周期 < -50% → 流动性极低，confidence 降一级
+- spoofing_risk 高或 wall 极短暂 → orderbook 仅作弱证据
+- tradeflow coverage < 30% → 方向结论降权
+- 多周期方向冲突 → confidence 最高 medium
+- price 在 POC ± 0.5% / 区间中部 → 默认 wait
+- derived signal 与 raw facts 冲突 → derived 无效
+- vol vs avg20 全周期 < -50% → confidence 降一级
 
 ════════════════════════════════════
-多空对称性强制要求
+多空对称性
 ════════════════════════════════════
-- fresh_long_setup 和 fresh_short_setup 字段必须完全对称
-- 不默认 long 更优先，除非 raw facts 明确单边支持
-- 价格在区间中部 → 两方向 confidence 对等降低，wait_condition 优先
-- 可以输出 no-trade / insufficient_edge，这是有效结论，不是失败
+- long/short setup 字段完全对称，不默认 long 更优先
+- 区间中部 → 两方向 confidence 对等降低，wait_condition 优先
+- no-trade / insufficient_edge 是有效结论
 
 ════════════════════════════════════
-允许的主结论动作标签
+时间规划约束（中性，不预设方向）
+════════════════════════════════════
+所有时间字段必须基于 RAW_FACTS + DATA_QUALITY 推导，
+不得引用 weak_ref_* / optional_plan_hint_* 决定时间长短。
+时间规划是风险管理信息，不代表方向预设。
+
+▌ 有持仓时：
+  必须回答"还能拿多久、看到哪"→ 写入【持仓处理】的时间字段。
+  推导依据：多周期结构状态、关键位距离、ATR、资金费率倒计时、数据质量。
+
+▌ 无持仓且主结论为观望/不交易时：
+  必须回答"还需等多久、等什么"→ 写入【新计划】的 wait_condition 时间字段。
+  推导依据：距离关键触发位远近、波动性、K 线周期、数据质量。
+
+▌ 超时处理规则：
+  - 有持仓：超过 max_patience_window 仍无进展 → 必须给出明确动作（减仓/平仓/继续并更新保护位）
+  - 无持仓：超过 setup_expiry → 计划自动失效，需重新评估
+
+════════════════════════════════════
+允许的主结论标签
 ════════════════════════════════════
 立即开多 / 立即开空 / 持有 / 减仓 / 加仓 / 平仓 / 反手 / 观望 / 不交易
 
-观望 / 不交易是合法结论。当以下任一条件成立时，优先输出它们：
+观望 / 不交易是合法结论。当以下任一条件成立时，优先输出：
   - tradeability = low_edge / not_tradable
   - confidence = low 且 data quality 差
   - 价格在关键区间中部，多空信号混合
 
 ════════════════════════════════════
-输出格式（必须严格按顺序，不得省略任何一级标题）
+输出格式（严格按顺序，不得省略任何一级标题）
 ════════════════════════════════════
+压缩规则：
+- 每个 section 只承担一种职责，不得重复展开同一组证据
+- bullish_evidence / bearish_evidence / quality_penalties 各最多 3 条，每条一句话
+- 【当前动作】只给结论，不重述证据细节
+- fresh_long/short_setup 的 edge_ref 仅引用记分板编号（如 bull#1 + quality#2），不复述
 
 【市场状态】
 trend_state: <bullish / bearish / mixed / neutral>
 tradeability: <tradable / low_edge / not_tradable>
 key_zone: <当前最关键支撑或阻力区间，含具体价位>
-multi_tf_alignment: <aligned / divergent — 各周期方向一行简述>
+multi_tf_alignment: <aligned / divergent — 仅一句话>
 
 【证据记分板】
-bullish_evidence:
-  - <具体指标数值依据>
-  - <...>
-bearish_evidence:
-  - <具体指标数值依据>
-  - <...>
-quality_penalties:
-  - <数据质量降权项，例如：tradeflow_cov=0.06 低，方向降权>
-verdict: <bull > bear by [差距描述] / bear > bull by [差距] / balanced>
+bullish_evidence:（最多 3 条）
+  1. <一句话 + 具体数值>
+  2. <...>
+  3. <...>
+bearish_evidence:（最多 3 条）
+  1. <一句话 + 具体数值>
+  2. <...>
+  3. <...>
+quality_penalties:（最多 3 条）
+  1. <一句话>
+  2. <...>
+verdict: <bull > bear by [一句话] / bear > bull by [一句话] / balanced>
 
 【当前动作】
 主结论: <立即开多 / 立即开空 / 持有 / 减仓 / 加仓 / 平仓 / 反手 / 观望 / 不交易>
-一句话理由: <必须引用具体数值，不得写模糊描述>
+一句话理由: <引用具体数值，不得模糊>
 当前关键位: <具体价位>
 confidence: <high / medium / low>
-why_this_action: <为什么是这个动作而不是其他，必须包含比较>
-why_not_opposite: <为什么不是反向，或为什么等待而不是立即进>
+decision_logic: <为什么选这个动作而非其他（含对比），一句话>
 
 【执行卡片】
 now_action: <与主结论一致>
 entry_zone: <具体价格区间；若非开仓，写 "only if triggered @ [zone]">
-add_zone: <加仓区间；若无计划，写 none>
-reduce_zone: <减仓区间；若无计划，写 none>
-stop_loss: <执行止损价，必须是具体数字>
-invalidation: <结构失效条件，必须包含具体价位 + 触发行为>
-T0: <减仓/保本位，格式：价格 @ 减仓幅度，例如 70000 @ 减25%>
+stop_loss: <具体数字>
+invalidation: <具体价位 + 触发行为>
+T0: <减仓/保本位，价格 @ 减仓幅度>
 T1: <结构目标价>
 T2: <延伸目标价>
-expected_RR: <数字例如 1:2.5；若观望/不交易，写 N/A>
-time_in_force: <有效时间窗口>
+expected_RR: <数字；若观望/不交易，写 N/A>
+time_in_force: <整套计划有效期>
 
 【持仓处理】
+（若无持仓，仅写 current_position: no_open_position，跳过其余字段）
 current_position: <side> <size_btc> @ <entry_price> | mark=<mark> | uPnL=<pnl> | liq=<liq>
-（若无持仓，写：no_open_position）
-hold_condition: <满足什么条件继续持有，必须含具体价位>
+thesis_still_valid: <是 / 否 + 依据（基于 raw facts，不得引用 bias/score）>
+hold_condition: <继续持有条件，含具体价位>
 reduce_condition: <何时减仓 + 减多少>
-add_condition: <何时加仓 + 加仓价位 + 加仓后新保护位>
-exit_condition: <何时全平，必须含具体触发价或事件>
+exit_condition: <何时全平，含具体触发价>
 protect_profit_rule: <如何保护浮盈>
+expected_hold_window: <预计还能持有多久，例如"2根1h K内"/"到下一根4h收盘"/"下次资金费率前">
+next_reassessment_at: <下一次必须重新评估的时间或事件，例如"下根1h收盘后"/"价格触及 69500 时">
+time_stop_condition: <如果多久内持仓没有按预期发展，则执行什么动作，例如"2h内未反弹至 70200 → 减仓50%">
+max_patience_window: <最多容忍多久不走出来，超时后的明确动作>
 
-【空仓视角的新计划】
-（忽略当前持仓，假设空仓，重新独立评估）
+【新计划】
+（假设空仓，独立评估）
 
 fresh_long_setup:
-  trigger: <触发条件，必须含具体价位或行为>
+  trigger: <触发条件，含具体价位或行为>
   entry_zone: <具体价格区间>
-  stop_loss: <执行止损价>
-  invalidation: <结构失效条件，含具体价位 + 触发行为>
-  T0: <价格 @ 减仓幅度>
-  T1: <结构目标>
-  T2: <延伸目标>
+  stop_loss: <具体数字>
+  invalidation: <具体价位 + 触发行为>
+  T0 / T1 / T2: <价格>
   expected_RR: <数字>
   confidence: <high / medium / low>
-  edge_basis: <证据依据，必须引用具体指标数值>
+  edge_ref: <引用记分板编号，如 bull#1 + bull#3>
+  setup_expiry: <该计划最晚何时失效，例如"4h内未触发则作废">
 
 fresh_short_setup:
   trigger: <触发条件>
   entry_zone: <具体价格区间>
-  stop_loss: <执行止损价>
-  invalidation: <结构失效条件，含具体价位 + 触发行为>
-  T0: <价格 @ 减仓幅度>
-  T1: <结构目标>
-  T2: <延伸目标>
+  stop_loss: <具体数字>
+  invalidation: <具体价位 + 触发行为>
+  T0 / T1 / T2: <价格>
   expected_RR: <数字>
   confidence: <high / medium / low>
-  edge_basis: <证据依据，必须引用具体指标数值>
+  edge_ref: <引用记分板编号，如 bear#1 + bear#2>
+  setup_expiry: <该计划最晚何时失效>
 
 wait_condition:
-  when_to_wait: <什么情况下不做任何操作，必须具体>
-  what_to_wait_for: <等待哪个具体信号出现再进场>
-  no_trade_reason: <若 tradeability=not_tradable，说明具体原因>
+  when_to_wait: <什么情况不操作，必须具体>
+  what_to_wait_for: <等什么信号再进场>
+  expected_wait_window: <预计还需等待多久，例如"1-2根1h K"/"亚盘结束前">
+  next_reassessment_at: <下一次重新评估的时间或事件>
+  timeout_action: <若到时仍未触发：继续观望 / 取消计划 / 重新评估>
+  no_trade_reason: <若 tradeability=not_tradable，说明原因>
 
 【偏置审计】
-derived_fields_checked: <读取了哪些 SECTION 3/4 字段>
-bias_conflict_detected: <是否有 derived 字段与 raw facts 冲突，yes / no>
-conflict_detail: <若 yes，说明哪个字段冲突，如何解决>
-fields_ignored: <哪些 derived 字段因冲突或偏置被降权 / 忽略>
+bias_conflict: <yes / no>
+detail: <若 yes，一句话说明冲突及处理>
+fields_ignored: <被降权/忽略的字段列表>
 
 ════════════════════════════════════
-额外硬规则（违反即为无效输出）
+硬规则（违反即为无效输出）
 ════════════════════════════════════
-1. 所有模糊句必须后接具体阈值或动作
-   以下表达如果单独出现则视为无效：
-   "更像/偏多/偏空/先看能不能站上/警惕回落/不适合追/可以继续拿/
-    值得继续博/关注突破/留意支撑/阻力较大/需要确认/先观察/
-    继续关注/看情况/灵活处理/谨慎应对"
-   → 每句后必须跟：具体价位 + 对应动作
-2. 输出"持有" → 必须同时说明 hold_condition / reduce_condition / exit_condition
-3. 输出"观望"/"不交易" → 必须说明：不做原因 + 具体等待触发位 + 触发后方向
-4. 输出"减仓" → 必须说明减多少（25% / 50% / 只留底仓）
-5. 输出"加仓" → 必须说明加仓前提 + 加仓价位 + 加仓后新保护位
-6. stop_loss 必须是具体数字，不能只写区间
-7. invalidation 必须包含具体价位 + 触发行为，不能只写"跌破支撑"
-8. T0 = 减仓/保本位（不是主止盈）；T1 = 结构目标；T2 = 延伸目标
-9. 无论 has_open_position 是 true 还是 false，
-   【持仓处理】和【空仓视角的新计划】都必须同时完整输出
-10. fresh_long_setup 和 fresh_short_setup 字段必须完全对称，
-    不得省略其中一个（除非明确写出 no_trade_reason）"""
+1. 模糊句禁止单独出现（"更像/偏多/偏空/先看能不能站上/警惕回落/不适合追/
+   可以继续拿/值得继续博/关注突破/留意支撑/阻力较大/需要确认/先观察/
+   继续关注/看情况/灵活处理/谨慎应对"）→ 后接具体价位 + 动作
+2. 持有 → 必须填 hold_condition / reduce_condition / exit_condition + 四个时间字段
+3. 观望/不交易 → 必须填 wait_condition 全部字段（含时间规划）
+4. 减仓 → 必须写减多少（25% / 50% / 只留底仓）
+5. 加仓 → 必须写前提 + 价位 + 新保护位
+6. stop_loss 必须是具体数字
+7. invalidation 必须含具体价位 + 触发行为
+8. T0 = 减仓/保本位；T1 = 结构目标；T2 = 延伸目标
+9. fresh_long 和 fresh_short 字段完全对称，不得省略其中一个
+10. 有持仓时：【持仓处理】完整输出 + 【新计划】作为次级对照
+    无持仓时：【持仓处理】仅写 no_open_position + 【新计划】作为主模块"""
 
-    def build(self, context: Dict, report_mode: str = "raw_first") -> str:
+    def build(
+        self,
+        context: Dict,
+        report_mode: str = "raw_first",
+        include_instructions: bool = True,
+    ) -> str:
+        """Build the report text.
+
+        Args:
+            include_instructions: Append ANALYSIS_SYSTEM_PROMPT at the end so the
+                report is self-contained when pasted manually into any AI.
+                Set to False when the caller (e.g. --auto-analyze) already sends
+                the prompt as a separate system message to avoid duplication.
+        """
         # ── SECTION 1: RAW_FACTS ──────────────────────────────────────────────
         # Objective market facts only. No derived labels, no directional bias.
         # AI must complete PHASE A judgment based solely on this section.
@@ -342,14 +362,13 @@ fields_ignored: <哪些 derived 字段因冲突或偏置被降权 / 忽略>
             sections.append("")
             sections += self._deployment_hints(context)
 
-        # ── ANALYSIS INSTRUCTIONS ─────────────────────────────────────────────
-        # Self-contained: report can be pasted to any AI without system prompt.
-        sections += [
-            "",
-            "─" * 60,
-            "=== ANALYSIS INSTRUCTIONS ===",
-            self.ANALYSIS_SYSTEM_PROMPT,
-        ]
+        if include_instructions:
+            sections += [
+                "",
+                "─" * 60,
+                "=== ANALYSIS INSTRUCTIONS ===",
+                self.ANALYSIS_SYSTEM_PROMPT,
+            ]
 
         return "\n".join(sections).strip()
 

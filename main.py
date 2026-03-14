@@ -831,7 +831,9 @@ def _run_once(args: argparse.Namespace) -> int:
             logger.error("--auto-analyze requires %s to be set", OPENAI_API_KEY_ENV)
             return 1
         logger.info("sending prompt to %s for analysis...", args.ai_model)
-        prompt_text = report_path.read_text(encoding="utf-8")
+        prompt_text = PromptGenerator().build(
+            ai_context, report_mode=args.report_mode, include_instructions=False,
+        )
         analysis = _run_ai_analysis(openai_key, args.ai_model, prompt_text)
         analysis_path = _resolve_analysis_path(context_path)
         analysis_path.parent.mkdir(parents=True, exist_ok=True)
