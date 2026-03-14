@@ -19,7 +19,7 @@ try:
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        REPORT_MODE, SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from .context import MarketContextBuilder
@@ -33,7 +33,7 @@ except ImportError:
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        REPORT_MODE, SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from context import MarketContextBuilder
@@ -213,6 +213,11 @@ def build_market_context(
             for period in ("5m", "15m", "1h")
         }
         fut_force = pool.submit(collector.get_force_orders, symbol, limit=100)
+        fut_spot_trades = pool.submit(collector.get_spot_agg_trades, symbol, 1000)
+        fut_spot_ticker = pool.submit(collector.get_spot_ticker, symbol)
+        fut_spot_klines_1h = pool.submit(collector.get_spot_klines, symbol, "1h", 120)
+        fut_okx_oi = pool.submit(collector.get_okx_open_interest, symbol)
+        fut_bybit_oi = pool.submit(collector.get_bybit_open_interest, symbol)
 
         if include_account:
             fut_account = pool.submit(collector.get_account_positions, symbol=symbol)
@@ -234,6 +239,11 @@ def build_market_context(
         oi_histories = {period: fut.result() for period, fut in fut_oi_hist.items()}
         force_orders = fut_force.result()
         orderbook_snapshots = fut_orderbook_snapshots.result()
+        spot_trades = fut_spot_trades.result()
+        spot_ticker = fut_spot_ticker.result()
+        spot_klines_1h = fut_spot_klines_1h.result()
+        okx_oi = fut_okx_oi.result()
+        bybit_oi = fut_bybit_oi.result()
 
         if fut_account is not None:
             account_positions = fut_account.result()
@@ -278,6 +288,8 @@ def build_market_context(
         orderbook_snapshots = [orderbook]
     orderbook_features = feature_extractor.extract_orderbook_features(orderbook)
     trade_flow = feature_extractor.extract_trade_flow_features(agg_trades, large_trade_quantile)
+    trade_flow["kline_flow"] = feature_extractor.extract_kline_flow(klines_by_timeframe.get("1m", []))
+    trade_flow["price_level_delta"] = feature_extractor.extract_price_level_delta(agg_trades)
     orderbook_dynamics = feature_extractor.extract_orderbook_dynamics(orderbook_snapshots, trades=agg_trades)
 
     volume_change = feature_extractor.extract_volume_change(klines_by_timeframe)
@@ -392,9 +404,33 @@ def build_market_context(
     context["signal_score"] = signal_score
     context["summary_files"] = {}
 
+    primary_tf_for_price = timeframes[0]
+    current_price_for_spot = indicators_by_timeframe[primary_tf_for_price]["price"]
+    context["spot_perp"] = feature_extractor.extract_spot_perp_features(
+        spot_trades=spot_trades,
+        spot_ticker=spot_ticker,
+        perp_price=current_price_for_spot,
+        perp_funding_rate=float(funding.get("funding_rate", 0)),
+    )
+    context["cross_exchange_oi"] = feature_extractor.extract_cross_exchange_oi(
+        binance_oi=open_interest,
+        okx_oi=okx_oi,
+        bybit_oi=bybit_oi,
+    )
+
     if include_charts and chart_generator_cls is not None:
         chart_generator = chart_generator_cls(output_dir=charts_path, bars_by_timeframe=CHART_BARS)
-        context["chart_files"] = chart_generator.generate(symbol, klines_by_timeframe, context=context)
+        chart_files = chart_generator.generate(symbol, klines_by_timeframe, context=context)
+        spot_perp_path = charts_path / f"{symbol}_spot_perp.png"
+        sp_result = chart_generator.generate_spot_perp_chart(
+            symbol=symbol,
+            perp_klines=klines_by_timeframe.get("1h", []),
+            spot_klines=spot_klines_1h,
+            output_path=spot_perp_path,
+        )
+        if sp_result:
+            chart_files["spot_perp"] = sp_result
+        context["chart_files"] = chart_files
 
     return context
 
@@ -429,6 +465,9 @@ def _sanitize_context_for_ai_output(context: Dict) -> Dict:
     trade_flow = sanitized.get("trade_flow", {})
     if isinstance(trade_flow, dict):
         trade_flow.pop("cvd_path", None)
+        pld = trade_flow.get("price_level_delta", {})
+        if isinstance(pld, dict):
+            pld.pop("all_bins", None)
 
     return sanitized
 
@@ -450,7 +489,12 @@ def _cleanup_alternate_prompt_output(report_path: Path) -> None:
         return
 
 
-def write_outputs(context: Dict, context_path: Path, report_path: Path) -> Dict:
+def write_outputs(
+    context: Dict,
+    context_path: Path,
+    report_path: Path,
+    report_mode: str = "raw_first",
+) -> Dict:
     context_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     ai_context = _sanitize_context_for_ai_output(context)
@@ -458,7 +502,7 @@ def write_outputs(context: Dict, context_path: Path, report_path: Path) -> Dict:
     with context_path.open("w", encoding="utf-8") as f:
         json.dump(ai_context, f, ensure_ascii=False, indent=2)
 
-    prompt = PromptGenerator().build(ai_context)
+    prompt = PromptGenerator().build(ai_context, report_mode=report_mode)
     with report_path.open("w", encoding="utf-8") as f:
         f.write(prompt)
     _cleanup_alternate_prompt_output(report_path)
@@ -602,6 +646,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         dest="report_file",
         default=None,
         help="Optional custom report/prompt txt path",
+    )
+    parser.add_argument(
+        "--report-mode",
+        dest="report_mode",
+        default=REPORT_MODE,
+        choices=["raw_first", "full_debug"],
+        help=(
+            "Report generation mode: 'raw_first' (default) outputs only raw facts with no "
+            "directional labels; 'full_debug' appends derived/score/deployment fields as an appendix."
+        ),
     )
     parser.add_argument("--chart-dir", default=None, help="Optional custom chart output directory")
     parser.add_argument(
@@ -755,7 +809,7 @@ def _run_once(args: argparse.Namespace) -> int:
         chart_generator_cls=chart_generator_cls,
         cache_ttl=args.cache_ttl,
     )
-    ai_context = write_outputs(context, context_path, report_path)
+    ai_context = write_outputs(context, context_path, report_path, report_mode=args.report_mode)
     if args.include_summary:
         summary_path = write_summary_output(context, context_path)
         with context_path.open("w", encoding="utf-8") as f:
@@ -777,7 +831,9 @@ def _run_once(args: argparse.Namespace) -> int:
             logger.error("--auto-analyze requires %s to be set", OPENAI_API_KEY_ENV)
             return 1
         logger.info("sending prompt to %s for analysis...", args.ai_model)
-        prompt_text = report_path.read_text(encoding="utf-8")
+        prompt_text = PromptGenerator().build(
+            ai_context, report_mode=args.report_mode, include_instructions=False,
+        )
         analysis = _run_ai_analysis(openai_key, args.ai_model, prompt_text)
         analysis_path = _resolve_analysis_path(context_path)
         analysis_path.parent.mkdir(parents=True, exist_ok=True)

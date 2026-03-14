@@ -60,7 +60,7 @@ class AIAdvisor:
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": PromptGenerator.SYSTEM_PROMPT},
+                {"role": "system", "content": PromptGenerator.ANALYSIS_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=self.temperature,
@@ -73,7 +73,7 @@ class AIAdvisor:
             {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": PromptGenerator.SYSTEM_PROMPT},
+                    {"role": "system", "content": PromptGenerator.ANALYSIS_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": self.temperature,

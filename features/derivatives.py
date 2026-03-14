@@ -251,6 +251,18 @@ class DerivativesMixin(FeatureBase):
         else:
             crowding = "balanced"
 
+        # Momentum: direction of ratio over recent bars
+        if len(ratios) >= 5:
+            momentum_delta = ratios[-1] - ratios[-5]
+            if momentum_delta > 0.05:
+                momentum = "rising"
+            elif momentum_delta < -0.05:
+                momentum = "falling"
+            else:
+                momentum = "flat"
+        else:
+            momentum = "unknown"
+
         history = [
             {
                 "timestamp": int(row.get("timestamp", 0)),
@@ -268,6 +280,7 @@ class DerivativesMixin(FeatureBase):
             "long_account": round(long_account, 6),
             "short_account": round(short_account, 6),
             "crowding": crowding,
+            "momentum": momentum,
             "history": history,
         }
 
@@ -320,6 +333,35 @@ class DerivativesMixin(FeatureBase):
             "basis_abs": round(basis_abs, 6),
             "basis_bps": round(basis_bps, 6),
             "structure": structure,
+        }
+
+    @staticmethod
+    def extract_cross_exchange_oi(
+        binance_oi: float,
+        okx_oi: Dict,
+        bybit_oi: Dict,
+    ) -> Dict:
+        """Aggregate open interest across Binance / OKX / Bybit.
+
+        OI units differ by exchange (Binance: contracts/BTC, OKX: BTC, Bybit: USDT).
+        Values are stored as-is with exchange labels for AI interpretation.
+        """
+        sources: Dict[str, Dict] = {
+            "binance": {"available": True, "oi": round(binance_oi, 4), "unit": "BTC"},
+        }
+        if okx_oi.get("available"):
+            sources["okx"] = {"available": True, "oi": round(float(okx_oi.get("oi", 0)), 4), "unit": "BTC"}
+        else:
+            sources["okx"] = {"available": False, "oi": 0.0}
+        if bybit_oi.get("available"):
+            sources["bybit"] = {"available": True, "oi": round(float(bybit_oi.get("oi", 0)), 4), "unit": "USDT"}
+        else:
+            sources["bybit"] = {"available": False, "oi": 0.0}
+
+        available_count = sum(1 for v in sources.values() if v.get("available"))
+        return {
+            "available_count": available_count,
+            "sources": sources,
         }
 
     @staticmethod

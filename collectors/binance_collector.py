@@ -263,6 +263,9 @@ class BinanceFuturesCollector:
                     "close": float(row[4]),
                     "volume": float(row[5]),
                     "close_time": int(row[6]),
+                    "quote_volume": float(row[7]),
+                    "taker_buy_base": float(row[9]),
+                    "taker_buy_quote": float(row[10]),
                 }
             )
         return candles
@@ -453,6 +456,112 @@ class BinanceFuturesCollector:
 
         trades.sort(key=lambda row: row["timestamp"])
         return trades
+
+    # ── Spot market data ─────────────────────────────────────────────────
+
+    _SPOT_BASE_URL = "https://api.binance.com"
+
+    def get_spot_agg_trades(self, symbol: str, limit: int = 1000) -> List[Dict]:
+        """Fetch recent spot market agg trades for CVD comparison."""
+        url = f"{self._SPOT_BASE_URL}/api/v3/aggTrades?symbol={symbol}&limit={min(limit, 1000)}"
+        try:
+            payload = self._get_json_url(url)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        trades: List[Dict] = []
+        for row in payload:
+            price = float(row["p"])
+            qty = float(row["q"])
+            is_buyer_maker = bool(row["m"])
+            trades.append(
+                {
+                    "price": price,
+                    "qty": qty,
+                    "quote_qty": price * qty,
+                    "aggressor_side": "sell" if is_buyer_maker else "buy",
+                    "timestamp": int(row["T"]),
+                }
+            )
+        trades.sort(key=lambda x: x["timestamp"])
+        return trades
+
+    def get_spot_klines(self, symbol: str, interval: str, limit: int) -> List[Dict]:
+        """Fetch spot market klines including taker buy fields."""
+        url = (
+            f"{self._SPOT_BASE_URL}/api/v3/klines"
+            f"?symbol={symbol}&interval={interval}&limit={min(limit, 1000)}"
+        )
+        try:
+            payload = self._get_json_url(url)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        candles: List[Dict] = []
+        for row in payload:
+            candles.append(
+                {
+                    "open_time": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "close_time": int(row[6]),
+                    "quote_volume": float(row[7]),
+                    "taker_buy_base": float(row[9]),
+                    "taker_buy_quote": float(row[10]),
+                }
+            )
+        return candles
+
+    def get_spot_ticker(self, symbol: str) -> Dict:
+        """Fetch spot 24h ticker for price and volume data."""
+        url = f"{self._SPOT_BASE_URL}/api/v3/ticker/24hr?symbol={symbol}"
+        try:
+            payload = self._get_json_url(url)
+            return {
+                "available": True,
+                "last_price": float(payload.get("lastPrice", 0)),
+                "volume": float(payload.get("volume", 0)),
+                "quote_volume": float(payload.get("quoteVolume", 0)),
+            }
+        except Exception as exc:
+            return {"available": False, "reason": str(exc)}
+
+    # ── Cross-exchange open interest ──────────────────────────────────────
+
+    def get_okx_open_interest(self, symbol: str) -> Dict:
+        """Fetch OKX perpetual swap open interest."""
+        if symbol.endswith("USDT"):
+            inst_id = f"{symbol[:-4]}-USDT-SWAP"
+        else:
+            inst_id = symbol
+        url = f"https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={inst_id}"
+        try:
+            payload = self._get_json_url(url)
+            rows = payload.get("data", [])
+            if rows:
+                oi_ccy = float(rows[0].get("oiCcy", 0) or 0)
+                return {"available": True, "oi": oi_ccy}
+        except Exception as exc:
+            return {"available": False, "oi": 0.0, "reason": str(exc)}
+        return {"available": False, "oi": 0.0, "reason": "empty_response"}
+
+    def get_bybit_open_interest(self, symbol: str) -> Dict:
+        """Fetch Bybit linear perpetual open interest."""
+        url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=1"
+        try:
+            payload = self._get_json_url(url)
+            rows = payload.get("result", {}).get("list", [])
+            if rows:
+                oi = float(rows[0].get("openInterest", 0) or 0)
+                return {"available": True, "oi": oi}
+        except Exception as exc:
+            return {"available": False, "oi": 0.0, "reason": str(exc)}
+        return {"available": False, "oi": 0.0, "reason": "empty_response"}
 
     def get_force_orders(self, symbol: str, limit: int = 100) -> List[Dict]:
         try:
