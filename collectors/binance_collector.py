@@ -2,12 +2,14 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, urlopen
+from urllib.request import ProxyHandler
 
 try:
     import httpx
@@ -17,9 +19,19 @@ except ImportError:
     _HAS_HTTPX = False
 
 try:
-    from ..config import BASE_URL, REQUEST_TIMEOUT
+    from httpx_socks import SyncProxyTransport
+
+    _HAS_HTTPX_SOCKS = True
+except ImportError:
+    SyncProxyTransport = None  # type: ignore
+    _HAS_HTTPX_SOCKS = False
+
+try:
+    from ..config import BASE_URL, HTTP_PROXY_ENV, HTTPS_PROXY_ENV, REQUEST_TIMEOUT
 except ImportError:
     from config import BASE_URL, REQUEST_TIMEOUT
+    HTTP_PROXY_ENV = "HTTP_PROXY"
+    HTTPS_PROXY_ENV = "HTTPS_PROXY"
 
 logger = logging.getLogger("btc_context.collector")
 
@@ -68,13 +80,32 @@ class BinanceFuturesCollector:
         self.api_key = self._sanitize_credential(api_key)
         self.api_secret = self._sanitize_credential(api_secret)
         self._cache = _TTLCache(default_ttl=cache_ttl) if cache_ttl > 0 else None
+        self._proxy: Optional[str] = os.environ.get(HTTPS_PROXY_ENV) or os.environ.get(HTTP_PROXY_ENV) or None
+        if self._proxy:
+            logger.info("Using proxy for collector: %s", self._proxy)
+        else:
+            logger.info("No proxy set (set HTTPS_PROXY or HTTP_PROXY to e.g. http://127.0.0.1:10808 to avoid 451)")
         self._httpx_client: Optional[Any] = None
         if _HAS_HTTPX:
-            self._httpx_client = httpx.Client(
+            client_kw: Dict[str, Any] = dict(
                 timeout=httpx.Timeout(timeout, connect=5.0),
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                trust_env=False,
             )
+            if self._proxy:
+                proxy_lower = self._proxy.lower().strip()
+                if proxy_lower.startswith("socks5://") or proxy_lower.startswith("socks5h://"):
+                    if _HAS_HTTPX_SOCKS and SyncProxyTransport is not None:
+                        client_kw["transport"] = SyncProxyTransport.from_url(self._proxy)
+                    else:
+                        logger.warning(
+                            "SOCKS proxy set but httpx-socks not installed; install with: pip install httpx-socks"
+                        )
+                        client_kw["proxy"] = self._proxy
+                else:
+                    client_kw["proxy"] = self._proxy
+            self._httpx_client = httpx.Client(**client_kw)
 
     @staticmethod
     def _sanitize_credential(value: Optional[str]) -> str:
@@ -189,8 +220,9 @@ class BinanceFuturesCollector:
         if params:
             url = f"{url}?{urlencode(params)}"
         request = Request(url, headers=headers or {})
+        opener = build_opener(ProxyHandler({"http": self._proxy, "https": self._proxy})) if self._proxy else build_opener()
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with opener.open(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             try:

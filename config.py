@@ -10,6 +10,11 @@ REQUEST_TIMEOUT = 10
 BINANCE_API_KEY_ENV = "BINANCE_API_KEY"
 BINANCE_API_SECRET_ENV = "BINANCE_API_SECRET"
 
+# Proxy (optional). When set, all collector HTTP requests go through it (e.g. to avoid 451).
+# Use HTTPS_PROXY or HTTP_PROXY; both are read by the collector.
+HTTPS_PROXY_ENV = "HTTPS_PROXY"
+HTTP_PROXY_ENV = "HTTP_PROXY"
+
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL = "gpt-4o"
 OPENAI_TEMPERATURE = 0.3

@@ -84,6 +84,12 @@ EOF
 chmod 600 .env.local
 source .env.local && python3 main.py --auto-analyze
 
+# 通过代理访问 Binance（避免 451 地域限制）
+export HTTPS_PROXY=http://127.0.0.1:10808
+python3 main.py
+# 若仍 451：多半是代理出口在受限地区（如美国）。在 v2rayN 中换为非美节点（如香港/新加坡/日本）再试。
+# 若代理是 SOCKS5：export HTTPS_PROXY=socks5://127.0.0.1:10808，并安装 pip install httpx-socks
+
 # 自定义输出路径
 python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 ```
