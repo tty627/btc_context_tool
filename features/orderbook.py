@@ -370,6 +370,25 @@ class OrderbookMixin(FeatureBase):
                 record["avg_qty"] = cls._safe_div(float(record["sum_qty"]), float(record["presence_count"]) or 1.0)
                 record["presence_ratio"] = cls._safe_div(float(record["presence_count"]), total_snapshots)
 
+        # -- aggregate imbalance stats across all snapshots --
+        imbalance_values = [s["imbalance"] for s in series]
+        avg_imbalance = cls._safe_div(sum(imbalance_values), len(imbalance_values))
+        max_imbalance = max(imbalance_values, default=0.0)
+        min_imbalance = min(imbalance_values, default=0.0)
+
+        # -- cancel-to-add ratio (total cancelled / total added) --
+        total_added = bid_added + ask_added
+        total_cancelled = bid_cancelled + ask_cancelled
+        cancel_to_add_ratio = cls._safe_div(total_cancelled, total_added)
+
+        # -- pull vs fill ratio --
+        # pull = wall disappeared without trade; fill = absorption + sweep
+        fill_events = wall_absorption_events + wall_sweep_events
+        pull_vs_fill_ratio = cls._safe_div(
+            float(wall_pull_without_trade_events),
+            float(fill_events),
+        )
+
         return {
             "snapshot_count": len(rows),
             "sample_duration_seconds": round(duration_seconds, 6),
@@ -385,8 +404,13 @@ class OrderbookMixin(FeatureBase):
             "best_ask_change_per_minute": round(cls._safe_div(best_ask_change_count * 60, duration_seconds), 6),
             "spread_change_count": spread_change_count,
             "mid_price_change_count": mid_price_change_count,
+            "avg_imbalance": round(avg_imbalance, 6),
+            "max_imbalance": round(max_imbalance, 6),
+            "min_imbalance": round(min_imbalance, 6),
             "avg_wall_lifetime_seconds": round(avg_wall_lifetime, 6),
             "max_wall_lifetime_seconds": round(max_wall_lifetime, 6),
+            "cancel_to_add_ratio": round(cancel_to_add_ratio, 4),
+            "pull_vs_fill_ratio": round(pull_vs_fill_ratio, 4),
             "wall_pull_events": wall_pull_events,
             "wall_add_events": wall_add_events,
             "wall_absorption_events": wall_absorption_events,

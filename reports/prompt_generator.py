@@ -861,7 +861,18 @@ The best answer is the cleanest decision."""
             )
             lines.append(
                 f"avg_wall_lifetime_sec={_f(od.get('avg_wall_lifetime_seconds'), 1)}  "
-                f"max_wall_lifetime_sec={_f(od.get('max_wall_lifetime_seconds'), 1)}"
+                f"max_wall_lifetime_sec={_f(od.get('max_wall_lifetime_seconds'), 1)}  "
+                f"sample_duration={_f(od.get('sample_duration_seconds'), 1)}s  "
+                f"snapshots={od.get('snapshot_count', _NA)}"
+            )
+            lines.append(
+                f"avg_imbalance={_f(od.get('avg_imbalance'), 4)}  "
+                f"max_imbalance={_f(od.get('max_imbalance'), 4)}  "
+                f"min_imbalance={_f(od.get('min_imbalance'), 4)}"
+            )
+            lines.append(
+                f"cancel_to_add_ratio={_f(od.get('cancel_to_add_ratio'), 4)}  "
+                f"pull_vs_fill_ratio={_f(od.get('pull_vs_fill_ratio'), 4)}"
             )
             lines.append(
                 f"passive_absorption_quote={_f(od.get('passive_absorption_quote', 0), 0)}  "
