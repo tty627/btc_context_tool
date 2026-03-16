@@ -13,9 +13,10 @@ from typing import Dict, Optional, Sequence, Tuple
 logger = logging.getLogger("btc_context")
 
 try:
-    from .collectors import BinanceFuturesCollector
+    from .collectors import BinanceFuturesCollector, ExternalDataCollector
     from .config import (
-        AGG_TRADES_LIMIT, AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        AGG_TRADES_LIMIT, AGG_TRADES_WINDOW_MINUTES,
+        AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
@@ -27,9 +28,10 @@ try:
     from .indicators import IndicatorEngine
     from .reports import PromptGenerator, SummaryTableGenerator
 except ImportError:
-    from collectors import BinanceFuturesCollector
+    from collectors import BinanceFuturesCollector, ExternalDataCollector
     from config import (
-        AGG_TRADES_LIMIT, AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
+        AGG_TRADES_LIMIT, AGG_TRADES_WINDOW_MINUTES,
+        AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
@@ -155,6 +157,7 @@ def build_market_context(
     kline_limit: int,
     depth_limit: int,
     agg_trades_limit: int,
+    agg_trades_window_minutes: int,
     large_trade_quantile: float,
     oi_period: str,
     oi_limit: int,
@@ -173,13 +176,14 @@ def build_market_context(
     cache_ttl: float = 0,
 ) -> Dict:
     collector = BinanceFuturesCollector(api_key=api_key, api_secret=api_secret, cache_ttl=cache_ttl)
+    ext_collector = ExternalDataCollector()
     engine = IndicatorEngine()
     feature_extractor = FeatureExtractor()
     context_builder = MarketContextBuilder()
 
     # ── Phase 1: fire all independent network calls in parallel ──────────
     all_kline_intervals = list(dict.fromkeys(
-        list(timeframes) + [tf for tf in ("5m", "15m", "1h") if tf not in timeframes]
+        list(timeframes) + [tf for tf in ("1m", "5m", "15m", "1h") if tf not in timeframes]
     ))
     all_kline_limit = max(kline_limit, 120)
 
@@ -194,7 +198,11 @@ def build_market_context(
             samples=orderbook_dynamic_samples,
             interval_seconds=orderbook_dynamic_interval,
         )
-        fut_agg_trades = pool.submit(collector.get_agg_trades, symbol, agg_trades_limit)
+        fut_agg_trades = pool.submit(
+            collector.get_agg_trades, symbol,
+            limit=agg_trades_limit,
+            window_minutes=agg_trades_window_minutes,
+        )
         fut_oi = pool.submit(collector.get_open_interest, symbol)
         fut_funding = pool.submit(collector.get_funding, symbol)
         fut_ticker = pool.submit(collector.get_ticker_24h, symbol)
@@ -218,6 +226,7 @@ def build_market_context(
         fut_spot_klines_1h = pool.submit(collector.get_spot_klines, symbol, "1h", 120)
         fut_okx_oi = pool.submit(collector.get_okx_open_interest, symbol)
         fut_bybit_oi = pool.submit(collector.get_bybit_open_interest, symbol)
+        fut_external = pool.submit(ext_collector.collect_all)
 
         if include_account:
             fut_account = pool.submit(collector.get_account_positions, symbol=symbol)
@@ -244,6 +253,7 @@ def build_market_context(
         spot_klines_1h = fut_spot_klines_1h.result()
         okx_oi = fut_okx_oi.result()
         bybit_oi = fut_bybit_oi.result()
+        external_data = fut_external.result()
 
         if fut_account is not None:
             account_positions = fut_account.result()
@@ -380,6 +390,7 @@ def build_market_context(
         volume_profile=volume_profile,
         trade_flow=trade_flow,
         liquidation_heatmap=liquidation_heatmap,
+        external_drivers=external_data,
         chart_files={},
     )
     position_sizing = feature_extractor.extract_position_sizing(
@@ -597,6 +608,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="AggTrades sample size for CVD/Delta calculation",
     )
     parser.add_argument(
+        "--agg-trades-window-minutes",
+        type=int,
+        default=AGG_TRADES_WINDOW_MINUTES,
+        help="Time window (minutes) for aggTrades collection; 0=use count-based limit only",
+    )
+    parser.add_argument(
         "--large-trade-quantile",
         type=float,
         default=LARGE_TRADE_QUANTILE,
@@ -792,6 +809,7 @@ def _run_once(args: argparse.Namespace) -> int:
         kline_limit=args.kline_limit,
         depth_limit=args.depth_limit,
         agg_trades_limit=args.agg_trades_limit,
+        agg_trades_window_minutes=args.agg_trades_window_minutes,
         large_trade_quantile=args.large_trade_quantile,
         oi_period=args.oi_period,
         oi_limit=args.oi_limit,

@@ -438,9 +438,91 @@ class BinanceFuturesCollector:
                 time.sleep(interval_seconds)
         return snapshots
 
-    def get_agg_trades(self, symbol: str, limit: int) -> List[Dict]:
+    def get_agg_trades(
+        self,
+        symbol: str,
+        limit: int = 3000,
+        window_minutes: int = 0,
+    ) -> List[Dict]:
+        """Fetch aggregated trades.
+
+        If *window_minutes* > 0, use time-based pagination to cover the full
+        window (e.g. 30 min) regardless of trade count.  Otherwise fall back to
+        the original count-based approach capped by *limit*.
+        """
         batch_size = min(max(1, limit), 1000)
-        payload = self._get_json("/fapi/v1/aggTrades", {"symbol": symbol, "limit": str(batch_size)})
+
+        if window_minutes > 0:
+            rows = self._fetch_agg_trades_by_time(symbol, window_minutes, batch_size)
+        else:
+            rows = self._fetch_agg_trades_by_count(symbol, limit, batch_size)
+
+        trades: List[Dict] = []
+        for row in rows:
+            price = float(row["p"])
+            qty = float(row["q"])
+            is_buyer_maker = bool(row["m"])
+            trades.append(
+                {
+                    "id": int(row["a"]),
+                    "price": price,
+                    "qty": qty,
+                    "quote_qty": price * qty,
+                    "is_buyer_maker": is_buyer_maker,
+                    "aggressor_side": "sell" if is_buyer_maker else "buy",
+                    "timestamp": int(row["T"]),
+                }
+            )
+        trades.sort(key=lambda t: t["timestamp"])
+        return trades
+
+    # -- internal helpers for aggTrades pagination --
+
+    def _fetch_agg_trades_by_time(
+        self, symbol: str, window_minutes: int, batch_size: int,
+    ) -> list:
+        """Pull aggTrades covering at least *window_minutes* using startTime/endTime."""
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - window_minutes * 60 * 1000
+        all_rows: list = []
+        cursor_start = start_ms
+        max_iterations = 60
+
+        for _ in range(max_iterations):
+            params: Dict[str, str] = {
+                "symbol": symbol,
+                "startTime": str(cursor_start),
+                "endTime": str(now_ms),
+                "limit": str(batch_size),
+            }
+            payload = self._get_json("/fapi/v1/aggTrades", params)
+            if not isinstance(payload, list) or not payload:
+                break
+            all_rows.extend(payload)
+            if len(payload) < batch_size:
+                break
+            last_ts = int(payload[-1]["T"])
+            cursor_start = last_ts + 1
+            if cursor_start >= now_ms:
+                break
+
+        seen: set = set()
+        deduped: list = []
+        for row in all_rows:
+            aid = int(row["a"])
+            if aid not in seen:
+                seen.add(aid)
+                deduped.append(row)
+        return deduped
+
+    def _fetch_agg_trades_by_count(
+        self, symbol: str, limit: int, batch_size: int,
+    ) -> list:
+        """Original count-based aggTrades fetch."""
+        payload = self._get_json(
+            "/fapi/v1/aggTrades",
+            {"symbol": symbol, "limit": str(batch_size)},
+        )
         if not isinstance(payload, list):
             raise RuntimeError(f"unexpected aggTrades payload for {symbol}: {payload}")
 
@@ -458,36 +540,14 @@ class BinanceFuturesCollector:
             )
             if not isinstance(older_payload, list) or not older_payload:
                 break
-
-            older_rows = [row for row in older_payload if int(row["a"]) < earliest_id]
+            older_rows = [r for r in older_payload if int(r["a"]) < earliest_id]
             if not older_rows:
                 break
-
             rows = older_rows + rows
             earliest_id = int(older_rows[0]["a"])
             if earliest_id == 0:
                 break
-
-        trades: List[Dict] = []
-        for row in rows[-limit:]:
-            price = float(row["p"])
-            qty = float(row["q"])
-            is_buyer_maker = bool(row["m"])
-            trades.append(
-                {
-                    "id": int(row["a"]),
-                    "price": price,
-                    "qty": qty,
-                    "quote_qty": price * qty,
-                    "is_buyer_maker": is_buyer_maker,
-                    # buyer maker=true means aggressive sell, false means aggressive buy
-                    "aggressor_side": "sell" if is_buyer_maker else "buy",
-                    "timestamp": int(row["T"]),
-                }
-            )
-
-        trades.sort(key=lambda row: row["timestamp"])
-        return trades
+        return rows[-limit:]
 
     # ── Spot market data ─────────────────────────────────────────────────
 
@@ -565,19 +625,30 @@ class BinanceFuturesCollector:
 
     # ── Cross-exchange open interest ──────────────────────────────────────
 
+    @staticmethod
+    def _okx_inst_id(symbol: str) -> str:
+        if symbol.endswith("USDT"):
+            return f"{symbol[:-4]}-USDT-SWAP"
+        return symbol
+
     def get_okx_open_interest(self, symbol: str) -> Dict:
         """Fetch OKX perpetual swap open interest."""
-        if symbol.endswith("USDT"):
-            inst_id = f"{symbol[:-4]}-USDT-SWAP"
-        else:
-            inst_id = symbol
+        inst_id = self._okx_inst_id(symbol)
         url = f"https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={inst_id}"
         try:
             payload = self._get_json_url(url)
+            code = str(payload.get("code", ""))
+            if code != "0":
+                return {
+                    "available": False, "oi": 0.0,
+                    "reason": f"okx_code={code} msg={payload.get('msg', '')}",
+                }
             rows = payload.get("data", [])
             if rows:
-                oi_ccy = float(rows[0].get("oiCcy", 0) or 0)
-                return {"available": True, "oi": oi_ccy}
+                row = rows[0]
+                oi_val = float(row.get("oi", 0) or 0)
+                oi_ccy = float(row.get("oiCcy", 0) or 0)
+                return {"available": True, "oi": oi_ccy if oi_ccy > 0 else oi_val}
         except Exception as exc:
             return {"available": False, "oi": 0.0, "reason": str(exc)}
         return {"available": False, "oi": 0.0, "reason": "empty_response"}
@@ -645,18 +716,23 @@ class BinanceFuturesCollector:
         except Exception as exc:
             data["bybit"] = {"available": False, "funding_rate": 0.0, "reason": str(exc)}
 
-        if symbol.endswith("USDT"):
-            base = symbol[:-4]
-            okx_inst_id = f"{base}-USDT-SWAP"
-        else:
-            okx_inst_id = symbol
+        okx_inst_id = self._okx_inst_id(symbol)
         okx_url = f"https://www.okx.com/api/v5/public/funding-rate?instId={okx_inst_id}"
         try:
             payload = self._get_json_url(okx_url)
-            rows = payload.get("data", [])
-            if rows:
-                funding_rate = float(rows[0].get("fundingRate") or 0.0)
-                data["okx"] = {"available": True, "funding_rate": funding_rate}
+            code = str(payload.get("code", ""))
+            if code != "0":
+                data["okx"] = {
+                    "available": False, "funding_rate": 0.0,
+                    "reason": f"okx_code={code} msg={payload.get('msg', '')}",
+                }
+            else:
+                rows = payload.get("data", [])
+                if rows:
+                    funding_rate = float(rows[0].get("fundingRate") or 0.0)
+                    data["okx"] = {"available": True, "funding_rate": funding_rate}
+                else:
+                    data["okx"] = {"available": False, "funding_rate": 0.0, "reason": "empty_data"}
         except Exception as exc:
             data["okx"] = {"available": False, "funding_rate": 0.0, "reason": str(exc)}
 

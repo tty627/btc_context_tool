@@ -25,7 +25,8 @@ class MarketContextBuilder:
         volume_profile: Dict,
         trade_flow: Dict,
         liquidation_heatmap: Dict,
-        chart_files: Dict[str, str],
+        external_drivers: Dict | None = None,
+        chart_files: Dict[str, str] | None = None,
     ) -> Dict:
         market_structure = {
             timeframe: metrics.get("features", {}).get("trend", "unknown")
@@ -54,5 +55,6 @@ class MarketContextBuilder:
             "volume_profile": volume_profile,
             "trade_flow": trade_flow,
             "liquidation_heatmap": liquidation_heatmap,
-            "chart_files": chart_files,
+            "external_drivers": external_drivers or {},
+            "chart_files": chart_files or {},
         }

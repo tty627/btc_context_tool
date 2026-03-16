@@ -578,6 +578,8 @@ The best answer is the cleanest decision."""
         sections += self._spot_vs_perp(context)
         sections.append("")
         sections += self._position_facts(context)
+        sections.append("")
+        sections += self._external_drivers(context)
 
         # ── SECTION 2: DATA_QUALITY ───────────────────────────────────────────
         # Coverage ratios, staleness flags, spoofing risk. Affects how to weight
@@ -1155,6 +1157,80 @@ The best answer is the cleanest decision."""
                 f"1.5xATR_dist={_f(sizing.get('sl_distance'), 1)}  "
                 f"ATR%={_f(sizing.get('sl_pct'), 3)}%"
             )
+
+        return lines
+
+    # ─── EXTERNAL DRIVERS ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _external_drivers(ctx: Dict) -> List[str]:
+        lines = ["=== EXTERNAL DRIVERS ==="]
+        ext = ctx.get("external_drivers", {})
+        if not ext:
+            lines.append("external_data: unavailable")
+            return lines
+
+        fg = ext.get("fear_greed", {})
+        if fg.get("available"):
+            lines.append(
+                f"fear_greed_index: {fg.get('value', 'N/A')} "
+                f"({fg.get('classification', '')})"
+            )
+        else:
+            lines.append(f"fear_greed_index: unavailable ({fg.get('reason', '')})")
+
+        oc = ext.get("onchain", {})
+        if oc.get("available"):
+            lines.append(
+                f"hashrate: {oc.get('hash_rate_th', 'N/A')} TH/s  "
+                f"difficulty: {oc.get('difficulty', 'N/A')}"
+            )
+            lines.append(
+                f"avg_block_interval: {oc.get('minutes_between_blocks', 'N/A')} min  "
+                f"blocks_mined_24h: {oc.get('n_blocks_mined_24h', 'N/A')}"
+            )
+            lines.append(
+                f"total_btc_sent_24h: {oc.get('total_btc_sent_24h', 'N/A')} BTC"
+            )
+        else:
+            lines.append(f"onchain: unavailable ({oc.get('reason', '')})")
+
+        mp = ext.get("mempool", {})
+        if mp.get("available"):
+            lines.append(
+                f"mempool: {mp.get('count', 0)} txs  "
+                f"vsize={mp.get('vsize_bytes', 0)}  "
+                f"total_fee={mp.get('total_fee_btc', 0)} BTC"
+            )
+        else:
+            lines.append(f"mempool: unavailable ({mp.get('reason', '')})")
+
+        fees = ext.get("fees", {})
+        if fees.get("available"):
+            lines.append(
+                f"fee_sat_vB: fastest={fees.get('fastest_fee', 'N/A')} "
+                f"30min={fees.get('half_hour_fee', 'N/A')} "
+                f"1h={fees.get('hour_fee', 'N/A')} "
+                f"econ={fees.get('economy_fee', 'N/A')}"
+            )
+
+        da = ext.get("difficulty_adjustment", {})
+        if da.get("available"):
+            lines.append(
+                f"diff_epoch: progress={da.get('progress_pct', 'N/A')}%  "
+                f"est_change={da.get('difficulty_change_pct', 'N/A')}%  "
+                f"remaining_blocks={da.get('remaining_blocks', 'N/A')}"
+            )
+
+        etf = ext.get("etf_flow", {})
+        if etf.get("available"):
+            flow = etf.get("total_net_flow_usd", 0)
+            lines.append(
+                f"btc_etf_flow: date={etf.get('date', 'N/A')}  "
+                f"net_flow=${flow:,.0f}"
+            )
+        else:
+            lines.append(f"btc_etf_flow: unavailable ({etf.get('reason', '')})")
 
         return lines
 
