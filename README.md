@@ -99,7 +99,7 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 | 文件 | 说明 |
 |------|------|
 | `output/btc_context.json` | 原始市场上下文 JSON（完整数据，含所有派生字段） |
-| `output/btc_report.txt` | 结构化市场数据面板（发送给 AI 的主报告） |
+| `output/btc_prompt.txt` | 结构化市场数据面板（发送给 AI 的 prompt） |
 | `output/btc_ai_analysis.md` | AI 行情分析（使用 `--auto-analyze` 时生成） |
 | `output/btc_summary.md` | 人类可读摘要表（使用 `--include-summary` 时生成） |
 | `output/charts/*.png` | K 线图表（需安装 matplotlib） |
@@ -108,7 +108,7 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 
 ## 报告模式说明
 
-`btc_report.txt` 支持两种生成模式，通过 `config.py` 中的 `REPORT_MODE` 或 `--report-mode` 参数控制：
+`btc_prompt.txt` 支持两种生成模式，通过 `config.py` 中的 `REPORT_MODE` 或 `--report-mode` 参数控制：
 
 | 模式 | 说明 |
 |------|------|
@@ -170,5 +170,5 @@ pip install -r requirements.txt
 
 - 所有 API 请求并发执行，采集速度快，通常在 5~10 秒内完成。
 - `btc_context.json` 保存完整原始数据，可供自定义后处理或调试。
-- `btc_report.txt` 默认为纯数据面板，适合直接作为 LLM prompt 使用。
+- `btc_prompt.txt` 默认为纯数据面板，适合直接作为 LLM prompt 使用。
 - 30m/1h K 线 Delta 需要 Binance 返回 `taker_buy_base` 字段；若不可用，报告中会标注 `kline_flow: unavailable`。

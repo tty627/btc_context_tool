@@ -15,6 +15,7 @@ from .signal_score import SignalScoreMixin
 from .spot_perp import SpotPerpMixin
 from .technical import TechnicalMixin
 from .trade_flow import TradeFlowMixin
+from .transition import TransitionMixin
 from .volume import VolumeMixin
 
 
@@ -24,6 +25,7 @@ class FeatureExtractor(
     VolumeMixin,
     DerivativesMixin,
     TradeFlowMixin,
+    TransitionMixin,
     LiquidationMixin,
     SessionMixin,
     DeploymentMixin,

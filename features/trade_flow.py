@@ -409,3 +409,53 @@ class TradeFlowMixin(FeatureBase):
             "top_sell_imbalance": [b["price"] for b in top_sell],
             "all_bins": sorted_bins,
         }
+
+    @staticmethod
+    def extract_key_level_flows(
+        trades: Sequence[Dict],
+        key_levels: Sequence[Dict],
+        radius_pct: float = 0.0015,
+    ) -> List[Dict]:
+        """Summarise taker buy/sell around each key level.
+
+        Args:
+            key_levels: list of {"name": str, "price": float}.
+            radius_pct: price radius as fraction (default 0.15 %).
+        """
+        if not trades or not key_levels:
+            return []
+        rows = list(trades)
+        results: List[Dict] = []
+        for kl in key_levels:
+            price = float(kl.get("price", 0))
+            if price <= 0:
+                continue
+            radius = price * radius_pct
+            lo, hi = price - radius, price + radius
+            buy_q, sell_q = 0.0, 0.0
+            for r in rows:
+                rp = float(r.get("price", 0))
+                if lo <= rp <= hi:
+                    q = float(r.get("quote_qty", 0))
+                    if r.get("aggressor_side") == "buy":
+                        buy_q += q
+                    else:
+                        sell_q += q
+            if buy_q + sell_q < 1:
+                continue
+            net = buy_q - sell_q
+            if buy_q + sell_q > 0 and abs(net) / (buy_q + sell_q) < 0.15:
+                tag = "absorbed"
+            elif net > 0:
+                tag = "buy_dominant"
+            else:
+                tag = "sell_dominant"
+            results.append({
+                "name": kl.get("name", "?"),
+                "price": round(price, 1),
+                "buy": round(buy_q, 0),
+                "sell": round(sell_q, 0),
+                "net": round(net, 0),
+                "tag": tag,
+            })
+        return results

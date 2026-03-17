@@ -176,26 +176,26 @@ Use breakout or breakdown stop-trigger plans only if:
 
 These rules are HARD GATES, not soft suggestions.
 
+The DATA_QUALITY section contains pre-computed gate verdicts
+(PASS / FAIL / BLOCKED / DEGRADED). Use them directly; do not re-derive.
+
 A. FLOW COVERAGE GATES
-- If 15m flow coverage < 0.30:
+- If 15m_flow_gate = FAIL:
   15m delta / tape / aggressor data cannot be primary directional evidence
-- If 30m flow coverage < 0.20:
+- If 30m_flow_gate = FAIL:
   30m flow can only be secondary context
-- If flow coverage is poor overall:
+- If both flow gates FAIL:
   do not build a strong narrative from trade flow
 
 B. ORDERBOOK QUALITY GATES
-- If orderbook sample duration < 20 seconds:
+- If dom_direction_gate = BLOCKED:
   DOM / walls / spoofing observations cannot determine direction
   They may only refine execution
-- If spoofing risk is medium or high:
-  visible walls must be treated as weak evidence
 
 C. VOLUME QUALITY GATES
-If multi-timeframe volume is materially below average:
-- lower confidence in continuation
-- lower confidence in breakout quality
-- avoid aggressive market chasing
+- If volume_gate = DEGRADED:
+  lower confidence in continuation and breakout quality
+  avoid aggressive market chasing
 
 D. WEAK METRICS
 The following are weak by default unless strongly confirmed:
@@ -350,7 +350,147 @@ But also:
 - do not produce vague phrases without concrete follow-up (price + action + time window)
 
 ==================================================
-13. OUTPUT FORMAT
+13–14. OUTPUT FORMAT & ANTI-FAILURE RULES
+==================================================
+
+(Moved to the end of the data prompt for better compliance.
+ See OUTPUT_FORMAT_TEMPLATE constant.)
+
+==================================================
+15. FINAL DECISION STANDARD
+==================================================
+
+Your output should feel like this:
+- structurally grounded
+- execution-aware
+- position-aware
+- selective
+- not biased toward activity
+- capable of giving pullback orders when justified
+- capable of giving trigger orders when justified
+- comfortable saying wait when neither is good
+
+The best answer is not the most active answer.
+The best answer is the cleanest decision.
+
+==================================================
+16. CAUSAL ANALYSIS REQUIREMENT
+==================================================
+
+Before outputting any directional judgment, you MUST answer these questions
+in your 【市场状态】market_read section:
+
+A. PRIMARY DRIVER
+- What is driving the current price move?
+- Is it spot-led or perp-led? (check basis, spot_perp delta, funding)
+- Is it passive absorption followed by push, or aggressive taker sweep?
+- Is it trend continuation, exhaustion, or inventory rebalance?
+
+B. FLOW QUALITY
+- Is the move confirmed by taker delta and CVD alignment?
+- Or is it thin-liquidity drift with no real aggressor?
+
+If you cannot identify a clear primary driver, lower tradeability by one tier.
+
+==================================================
+17. EXPLICIT WEIGHT HIERARCHY
+==================================================
+
+When signals conflict, apply this priority order. Higher rank overrides lower.
+
+A. DIRECTION WEIGHT (who decides bias):
+  1. 4H structure (trend + EMA alignment)
+  2. 1H structure
+  3. 1H momentum
+  4. 15m trigger / setup pattern
+  5. 5m flow confirmation
+
+B. EXECUTION WEIGHT (who decides entry quality):
+  1. location (distance to key level + RR)
+  2. risk/reward ratio
+  3. liquidity quality (volume gate + flow gate)
+  4. flow confirmation (CVD, taker delta, key_level_flow)
+
+C. VETO PRIORITY (any single one can block a trade):
+  1. dirty middle position (price inside decision band with no edge)
+  2. thick nearby resistance/support against direction
+  3. volume_gate = DEGRADED on all timeframes
+  4. dom_direction_gate = BLOCKED and flow gates both FAIL
+  5. RR < 1.5
+  6. 15m_flow_gate = FAIL and no kline_flow confirmation
+
+If a conflict between A.1 and A.3 exists (e.g. 4H bullish but 1H momentum_down),
+state: "higher structure holds; lower momentum is tactical warning, not reversal".
+
+==================================================
+18. INFORMATION VALIDITY CLASSIFICATION
+==================================================
+
+You MUST mentally classify each piece of evidence into one of three tiers
+before weighting it. Do not mix tiers in a single argument.
+
+A. STRUCTURAL (valid for hours to days):
+  - 4H/1H trend state
+  - daily anchors (prev_day, week, month levels)
+  - volume profile (POC, HVN, LVN)
+  - weekly VWAP
+  - funding regime (persistently positive/negative over 3+ periods)
+
+B. TACTICAL (valid for 15min to a few hours):
+  - 15m setup pattern
+  - OI trend over 1h
+  - session context (asia/europe/us)
+  - kline flow (30m/1h taker delta)
+  - basis direction
+
+C. EPHEMERAL (valid for < 15 minutes):
+  - orderbook dynamics (DOM walls, spoofing detection)
+  - 1m/5m aggressor layers
+  - real-time CVD path
+  - price-level delta footprint
+  - trade clusters
+
+Rules:
+- If a structural and ephemeral signal conflict, structural wins.
+- If only ephemeral evidence supports a trade, tradeability = low_edge at best.
+- Ephemeral evidence may refine entry timing but cannot establish direction.
+
+==================================================
+19. COUNTERFACTUAL CHECK
+==================================================
+
+After completing your main judgment, you MUST output a counterfactual block
+inside 【偏置审计】:
+
+counterfactual:
+  most_likely_wrong_if: <one specific condition that would invalidate your thesis>
+  switch_action: <what you would do if that condition occurs — e.g. exit / reverse / reduce>
+  weakest_input: <which single data point in your analysis is most likely to mislead you>
+
+This is not optional. Even for "wait" decisions, state what would change your mind.
+
+==================================================
+20. NO-TRADE EXPLANATION STANDARD
+==================================================
+
+When execution_mode = wait, the wait_plan MUST include:
+
+wait_plan:
+  status:
+  what_to_wait_for:
+  missing_element: <direction_confirmation / location_advantage / flow_quality / RR_threshold / structural_clarity>
+  bullish_trigger: <specific price + condition that would create a valid long setup>
+  bearish_trigger: <specific price + condition that would create a valid short setup>
+  re_read_trigger: <what external change should prompt re-running this analysis>
+  invalid_wait: <if this happens, the wait thesis itself is wrong>
+  notes:
+
+"Wait" is not a conclusion — it is an observation plan with concrete re-entry criteria."""
+
+    # ── Output format template (appended to data prompt, not in system) ───
+    OUTPUT_FORMAT_TEMPLATE = """\
+==================================================
+OUTPUT FORMAT — 必须严格按此模板输出
 ==================================================
 
 Use DIFFERENT templates depending on whether the user has a position.
@@ -431,8 +571,10 @@ If wait:
 wait_plan:
   status:
   what_to_wait_for:
-  bullish_confirmation:
-  bearish_confirmation:
+  missing_element: <direction_confirmation / location_advantage / flow_quality / RR_threshold / structural_clarity>
+  bullish_trigger: <specific price + condition>
+  bearish_trigger: <specific price + condition>
+  re_read_trigger: <what change should prompt re-analysis>
   invalid_wait:
   notes:
 
@@ -442,6 +584,10 @@ phase_b_result:
   alignment_with_market_read: <aligned / conflicted / mixed / not_applicable>
   did_weak_refs_change_decision: <yes / no>
   audit_note:
+counterfactual:
+  most_likely_wrong_if:
+  switch_action:
+  weakest_input:
 
 【一句人话总结】
 <用最简单的人话总结：现在市场像什么，最该做什么，不该做什么。2-3句。仅翻译前文结论，不得新增判断。>
@@ -498,12 +644,16 @@ phase_b_result:
   alignment_with_market_read: <aligned / conflicted / mixed / not_applicable>
   did_weak_refs_change_decision: <yes / no>
   audit_note:
+counterfactual:
+  most_likely_wrong_if:
+  switch_action:
+  weakest_input:
 
 【一句人话总结】
 <用最简单的人话总结：当前仓位该怎么处理，关键价位是什么。2-3句。仅翻译前文结论，不得新增判断。>
 
 ==================================================
-14. STRICT ANTI-FAILURE RULES
+STRICT ANTI-FAILURE RULES
 ==================================================
 
 1. Do not output a breakout plan just because pullback planning is harder.
@@ -520,24 +670,7 @@ phase_b_result:
 - invalidation 必须含具体价位 + 触发行为
 - T0 = 减仓/保本位；T1 = 结构目标；T2 = 延伸目标
 - 减仓 → 必须写减多少
-- 加仓 → 必须写前提 + 价位 + 新保护位
-
-==================================================
-15. FINAL DECISION STANDARD
-==================================================
-
-Your output should feel like this:
-- structurally grounded
-- execution-aware
-- position-aware
-- selective
-- not biased toward activity
-- capable of giving pullback orders when justified
-- capable of giving trigger orders when justified
-- comfortable saying wait when neither is good
-
-The best answer is not the most active answer.
-The best answer is the cleanest decision."""
+- 加仓 → 必须写前提 + 价位 + 新保护位"""
 
     def build(
         self,
@@ -545,18 +678,30 @@ The best answer is the cleanest decision."""
         report_mode: str = "raw_first",
         include_instructions: bool = True,
     ) -> str:
-        """Build the report text.
+        """Build the prompt text.
 
         Args:
-            include_instructions: Append ANALYSIS_SYSTEM_PROMPT at the end so the
-                report is self-contained when pasted manually into any AI.
-                Set to False when the caller (e.g. --auto-analyze) already sends
-                the prompt as a separate system message to avoid duplication.
+            include_instructions: Prepend ANALYSIS_SYSTEM_PROMPT before the data
+                panel so the prompt is self-contained when pasted manually into
+                any AI.  Set to False when the caller (e.g. --auto-analyze)
+                already sends the prompt as a separate system message.
         """
+        sections: List[str] = []
+
+        if include_instructions:
+            sections += [
+                "=== ANALYSIS INSTRUCTIONS (请先阅读此段指令，再分析下方数据) ===",
+                "",
+                self.ANALYSIS_SYSTEM_PROMPT,
+                "",
+                "─" * 60,
+                "",
+            ]
+
         # ── SECTION 1: RAW_FACTS ──────────────────────────────────────────────
         # Objective market facts only. No derived labels, no directional bias.
         # AI must complete PHASE A judgment based solely on this section.
-        sections: List[str] = [
+        sections += [
             self.PANEL_HEADER, "",
             "╔══════════════════════════════════════════════════════════╗",
             "║  SECTION 1: RAW_FACTS  (客观市场事实，AI 独立判断依据)      ║",
@@ -574,6 +719,8 @@ The best answer is the cleanest decision."""
         sections += self._trade_flow(context)
         sections.append("")
         sections += self._derivatives(context)
+        sections.append("")
+        sections += self._transition_dynamics(context)
         sections.append("")
         sections += self._spot_vs_perp(context)
         sections.append("")
@@ -622,13 +769,12 @@ The best answer is the cleanest decision."""
             sections.append("")
             sections += self._deployment_hints(context)
 
-        if include_instructions:
-            sections += [
-                "",
-                "─" * 60,
-                "=== ANALYSIS INSTRUCTIONS ===",
-                self.ANALYSIS_SYSTEM_PROMPT,
-            ]
+        sections += [
+            "",
+            "─" * 60,
+            "",
+            self.OUTPUT_FORMAT_TEMPLATE,
+        ]
 
         return "\n".join(sections).strip()
 
@@ -663,10 +809,64 @@ The best answer is the cleanest decision."""
         if w_parts:
             lines.append(f"window_coverage_ratio: {' | '.join(w_parts)}")
 
+        # ── HARD GATE VERDICTS ───────────────────────────────────────────
+        _FLOW_THRESHOLDS = {"15m": 0.30, "30m": 0.20}
+        for label, threshold in _FLOW_THRESHOLDS.items():
+            w = windows.get(label, {})
+            ratio = w.get("coverage_ratio")
+            if ratio is not None:
+                r = float(ratio)
+                if r >= threshold:
+                    lines.append(
+                        f"{label}_flow_gate: PASS (cov={_f(r, 2)} >= {threshold})"
+                    )
+                else:
+                    lines.append(
+                        f"{label}_flow_gate: FAIL (cov={_f(r, 2)} < {threshold})"
+                        f" -> {label} flow = secondary only"
+                    )
+            else:
+                lines.append(f"{label}_flow_gate: FAIL (no data)")
+
         od = ctx.get("orderbook_dynamics", {})
         snap = od.get("snapshot_count", _NA)
         dur = od.get("sample_duration_seconds", _NA)
         lines.append(f"orderbook_samples: {snap}  sample_duration_sec: {_f(dur, 1)}")
+
+        spoof = od.get("spoofing_risk", "unknown")
+        dur_val = float(dur) if dur != _NA else 0.0
+        if dur_val < 20:
+            lines.append(
+                f"dom_direction_gate: BLOCKED (sample_duration={_f(dur_val, 1)}s < 20s)"
+                f" -> DOM cannot determine direction"
+            )
+        elif spoof in ("high", "medium"):
+            lines.append(
+                f"dom_direction_gate: BLOCKED (spoofing_risk={spoof})"
+                f" -> DOM cannot determine direction"
+            )
+        else:
+            lines.append(f"dom_direction_gate: PASS (spoofing_risk={spoof})")
+
+        vc = ctx.get("volume_change", {})
+        vol_parts = []
+        for vtf in ("15m", "1h", "4h"):
+            v = vc.get(vtf, {})
+            vs_avg = v.get("vs_avg20_pct")
+            if vs_avg is not None:
+                vol_parts.append(f"{vtf}={_f(vs_avg, 1)}%")
+        any_low = any(
+            float(vc.get(t, {}).get("vs_avg20_pct", 0)) < -30
+            for t in ("15m", "1h", "4h")
+            if vc.get(t, {}).get("vs_avg20_pct") is not None
+        )
+        if any_low:
+            lines.append(
+                f"volume_gate: DEGRADED ({', '.join(vol_parts)})"
+                f" -> lower breakout/continuation confidence"
+            )
+        else:
+            lines.append(f"volume_gate: PASS ({', '.join(vol_parts)})")
 
         kf = tf.get("kline_flow", {})
         if not kf.get("available", False):
@@ -828,6 +1028,21 @@ The best answer is the cleanest decision."""
             lines.append(
                 f"zone [range] 4h_low_sweep: "
                 f"{_f(low_zone.get('zone_low'), 1)}-{_f(low_zone.get('zone_high'), 1)}"
+            )
+
+        da = ctx.get("daily_anchors", {})
+        if da.get("available"):
+            lines.append(f"[daily] prev_day_high: {_f(da.get('prev_day_high'), 1)}")
+            lines.append(f"[daily] prev_day_low: {_f(da.get('prev_day_low'), 1)}")
+            lines.append(f"[daily] weekly_vwap: {_f(da.get('weekly_vwap'), 1)}")
+            lines.append(
+                f"[daily] week_high: {_f(da.get('week_high'), 1)}  "
+                f"week_low: {_f(da.get('week_low'), 1)}"
+            )
+            lines.append(f"[daily] month_open: {_f(da.get('month_open'), 1)}")
+            lines.append(
+                f"[daily] month_high: {_f(da.get('month_high'), 1)}  "
+                f"month_low: {_f(da.get('month_low'), 1)}"
             )
 
         return lines
@@ -1004,6 +1219,17 @@ The best answer is the cleanest decision."""
             if all_imb:
                 lines.append(f"  high_imbalance_price_bins: {all_imb}")
 
+        klf = tf.get("key_level_flows", [])
+        if klf:
+            lines.append("key_level_flow:")
+            for kl in klf:
+                lines.append(
+                    f"  @{kl['price']}({kl['name']}): "
+                    f"buy={_f(kl.get('buy', 0), 0)} "
+                    f"sell={_f(kl.get('sell', 0), 0)} "
+                    f"net={_f(kl.get('net', 0), 0)} -> {kl.get('tag', '?')}"
+                )
+
         return lines
 
     # ─── 7. DERIVATIVES ─────────────────────────────────────────────────────
@@ -1089,6 +1315,45 @@ The best answer is the cleanest decision."""
                 f"funding_spread: {_f(spread.get('max_spread_bps'), 4)}bps  "
                 f"({spread.get('highest_exchange')} vs {spread.get('lowest_exchange')})"
             )
+
+        return lines
+
+    # ─── 7b. TRANSITION DYNAMICS ────────────────────────────────────────────
+
+    @staticmethod
+    def _transition_dynamics(ctx: Dict) -> List[str]:
+        lines = ["=== TRANSITION DYNAMICS (change rates & regime shifts) ==="]
+        tr = ctx.get("transition", {})
+        if not tr:
+            lines.append("transition_data: unavailable")
+            return lines
+
+        oi = tr.get("oi_rates", {})
+        for period in ("5m", "15m", "1h"):
+            r = oi.get(period, {})
+            lines.append(
+                f"OI_{period}: delta%={_f(r.get('delta_pct'), 4)}  "
+                f"velocity={_f(r.get('velocity'), 1)}  "
+                f"acceleration={_f(r.get('acceleration'), 1)}"
+            )
+
+        bd = tr.get("basis_dynamics", {})
+        lines.append(
+            f"basis: {_f(bd.get('basis_bps'), 2)}bps  regime={_v(bd.get('regime'))}"
+        )
+
+        fd = tr.get("funding_dynamics", {})
+        lines.append(
+            f"funding: rate={_f(fd.get('rate_pct'), 4)}%  "
+            f"regime={_v(fd.get('regime'))}  intensity={_v(fd.get('intensity'))}"
+        )
+
+        cd = tr.get("cvd_dynamics", {})
+        lines.append(
+            f"CVD: slope_5m={_f(cd.get('slope_5m'), 4)}  "
+            f"slope_15m={_f(cd.get('slope_15m'), 4)}  "
+            f"momentum={_v(cd.get('momentum'))}"
+        )
 
         return lines
 

@@ -2,7 +2,7 @@ from pathlib import Path
 
 BASE_URL = "https://fapi.binance.com"
 SYMBOL = "BTCUSDT"
-TIMEFRAMES = ("15m", "1h", "4h")
+TIMEFRAMES = ("15m", "1h", "4h", "1d")
 
 KLINE_LIMIT = 200
 DEPTH_LIMIT = 20
@@ -20,13 +20,20 @@ OPENAI_MODEL = "gpt-4o"
 OPENAI_TEMPERATURE = 0.3
 OPENAI_MAX_TOKENS = 4096
 
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
 TELEGRAM_BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
+
+PUSHPLUS_TOKEN_ENV = "PUSHPLUS_TOKEN"
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 CONTEXT_FILE = OUTPUT_DIR / "btc_context.json"
-REPORT_FILE = OUTPUT_DIR / "btc_report.txt"
+REPORT_FILE = OUTPUT_DIR / "btc_prompt.txt"
+SYSTEM_PROMPT_FILE = OUTPUT_DIR / "btc_system.txt"
 SUMMARY_FILE = OUTPUT_DIR / "btc_summary.md"
 CHART_DIR = OUTPUT_DIR / "charts"
 AI_ANALYSIS_FILE = OUTPUT_DIR / "btc_ai_analysis.md"
@@ -36,6 +43,7 @@ CHART_BARS = {
     "1h": 120,
     "15m": 120,
     "5m": 120,
+    "1d": 60,
 }
 
 AGG_TRADES_LIMIT = 3000

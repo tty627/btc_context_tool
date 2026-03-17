@@ -25,6 +25,7 @@ class MarketContextBuilder:
         volume_profile: Dict,
         trade_flow: Dict,
         liquidation_heatmap: Dict,
+        daily_anchors: Dict | None = None,
         external_drivers: Dict | None = None,
         chart_files: Dict[str, str] | None = None,
     ) -> Dict:
@@ -55,6 +56,7 @@ class MarketContextBuilder:
             "volume_profile": volume_profile,
             "trade_flow": trade_flow,
             "liquidation_heatmap": liquidation_heatmap,
+            "daily_anchors": daily_anchors or {"available": False},
             "external_drivers": external_drivers or {},
             "chart_files": chart_files or {},
         }

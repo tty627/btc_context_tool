@@ -6,7 +6,7 @@ Charts are structural-context aids for a downstream AI, NOT decision panels.
 • Show WHERE price is (structure, zones, key levels).
 • Do NOT show WHAT to do (no action labels, no OI/S-P badges, no trade advice).
 • Keep text labels minimal: object name + price tier only (POC, HVN2, 4H High …).
-• The AI reads btc_context.json / btc_report.txt for indicator values and flow data;
+• The AI reads btc_context.json / btc_prompt.txt for indicator values and flow data;
   charts supply the spatial / visual context that text cannot replicate.
 
 Three-tier level hierarchy
@@ -164,36 +164,88 @@ class KlineChartGenerator:
         if p > 0:
             levels.append({"name": name, "price": p, "source": source, "priority": priority})
 
-    def _collect_reference_levels(self, context: Dict) -> List[Dict]:
+    def _collect_reference_levels(self, context: Dict, mode: str = "all") -> List[Dict]:
+        """Collect reference levels filtered by chart mode.
+
+        mode controls which level groups are included:
+          structure  — 4H range, POC, daily anchors, EMA99
+          decision   — structure + EMA25, Session H/L
+          transition — POC, AVWAP, EMA25, HVN1, Session H/L
+          execution  — AVWAP, Session H/L, HVN1
+          all        — everything (legacy)
+        """
         levels: List[Dict] = []
         r4h = context.get("recent_4h_range", {})
-        self._append_level(levels, "4H High", r4h.get("high"), "range", 1)
-        self._append_level(levels, "4H Low",  r4h.get("low"),  "range", 1)
-
         vp = context.get("volume_profile", {})
-        self._append_level(levels, "POC", vp.get("poc_price"), "profile", 1)
-        for i, p in enumerate(vp.get("hvn_prices", [])[:3], 1):
-            self._append_level(levels, f"HVN{i}", p, "profile", 2)
-        for i, p in enumerate(vp.get("lvn_prices", [])[:3], 1):
-            self._append_level(levels, f"LVN{i}", p, "profile", 3)
-
-        anchor_names = {"recent_swing_high": "AVWAP-H", "recent_swing_low": "AVWAP-L"}
-        for i, a in enumerate(vp.get("anchored_profiles", []), 1):
-            if isinstance(a, dict):
-                self._append_level(
-                    levels,
-                    anchor_names.get(a.get("anchor_type"), f"AVWAP{i}"),
-                    a.get("anchored_vwap"),
-                    "anchored_vwap",
-                    2,
-                )
-
+        da = context.get("daily_anchors", {})
+        sc = context.get("session_context", {})
         tfs = context.get("timeframes", {})
-        for tf, pri in (("1h", 2), ("4h", 3)):
-            ema = tfs.get(tf, {}).get("ema", {})
-            if isinstance(ema, dict):
-                self._append_level(levels, f"{tf.upper()} EMA25", ema.get("25"), "ema", pri)
-                self._append_level(levels, f"{tf.upper()} EMA99", ema.get("99"), "ema", 3)
+
+        include_range = mode in ("structure", "decision", "all")
+        include_daily = mode in ("structure", "decision", "all")
+        include_poc = mode != "execution"
+        include_hvn = mode in ("transition", "execution", "all")
+        include_lvn = mode == "all"
+        include_avwap = mode in ("transition", "execution", "all")
+        include_ema25 = mode in ("decision", "transition", "all")
+        include_ema99 = mode in ("structure", "decision", "all")
+        include_session = mode in ("decision", "transition", "execution", "all")
+
+        if include_range:
+            self._append_level(levels, "4H High", r4h.get("high"), "range", 1)
+            self._append_level(levels, "4H Low",  r4h.get("low"),  "range", 1)
+
+        if include_daily and da.get("available"):
+            self._append_level(levels, "D High", da.get("prev_day_high"), "range", 1)
+            self._append_level(levels, "D Low",  da.get("prev_day_low"),  "range", 1)
+            self._append_level(levels, "W VWAP", da.get("weekly_vwap"),   "anchored_vwap", 2)
+            self._append_level(levels, "W High", da.get("week_high"),     "range", 2)
+            self._append_level(levels, "W Low",  da.get("week_low"),      "range", 2)
+            self._append_level(levels, "M Open", da.get("month_open"),    "range", 2)
+
+        if include_poc:
+            self._append_level(levels, "POC", vp.get("poc_price"), "profile", 1)
+
+        if include_hvn:
+            for i, p in enumerate(vp.get("hvn_prices", [])[:1], 1):
+                self._append_level(levels, f"HVN{i}", p, "profile", 2)
+
+        if include_lvn:
+            for i, p in enumerate(vp.get("lvn_prices", [])[:3], 1):
+                self._append_level(levels, f"LVN{i}", p, "profile", 3)
+
+        if include_avwap:
+            anchor_names = {"recent_swing_high": "AVWAP-H", "recent_swing_low": "AVWAP-L"}
+            for i, a in enumerate(vp.get("anchored_profiles", []), 1):
+                if isinstance(a, dict):
+                    self._append_level(
+                        levels,
+                        anchor_names.get(a.get("anchor_type"), f"AVWAP{i}"),
+                        a.get("anchored_vwap"),
+                        "anchored_vwap",
+                        2 if mode in ("transition",) else 1,
+                    )
+
+        if include_ema25:
+            for tf_name in ("1h",):
+                ema = tfs.get(tf_name, {}).get("ema", {})
+                if isinstance(ema, dict):
+                    self._append_level(levels, f"{tf_name.upper()} EMA25", ema.get("25"), "ema", 2)
+
+        if include_ema99:
+            for tf_name in ("4h",):
+                ema = tfs.get(tf_name, {}).get("ema", {})
+                if isinstance(ema, dict):
+                    self._append_level(levels, f"{tf_name.upper()} EMA99", ema.get("99"), "ema", 2)
+
+        if include_session:
+            sh = sc.get("session_high", 0)
+            sl = sc.get("session_low", 0)
+            if float(sh or 0) > 0:
+                self._append_level(levels, "Sess H", sh, "session", 2)
+            if float(sl or 0) > 0:
+                self._append_level(levels, "Sess L", sl, "session", 2)
+
         return levels
 
     # ─── zone-box builder ────────────────────────────────────────────────────
@@ -417,8 +469,17 @@ class KlineChartGenerator:
                 spans.append((start, i - 1, cur))
                 start, cur = i, lbl
         spans.append((start, len(candles) - 1, cur))
+        _SESSION_LABELS = {"asia": "Asia", "europe": "Europe", "us": "US"}
         for s, e, lbl in spans:
             ax.axvspan(s - 0.5, e + 0.5, color=self.SESSION_COLORS[lbl], alpha=0.18, zorder=0)
+            open_time = self._format_time(int(candles[s]["open_time"]))
+            display = _SESSION_LABELS.get(lbl, lbl)
+            ax.text(
+                s + 0.5, 1.0, f" {display} {open_time}",
+                transform=ax.get_xaxis_transform(),
+                fontsize=6.5, color="#5c4b3a", alpha=0.70,
+                ha="left", va="top",
+            )
 
     # ─── micro-structure zones (5m execution chart) ──────────────────────────
 
@@ -470,21 +531,139 @@ class KlineChartGenerator:
     @staticmethod
     def _chart_spec(timeframe: str) -> Dict:
         if timeframe == "4h":
-            return {"mode": "structure",   "title": "4H Structure",
-                    "oi_period": "1h",  "show_micro": False,
-                    "label_limit": 6,   "show_trade_clusters": False}
+            return {
+                "mode": "structure", "title": "4H Structure",
+                "panels": ["price", "volume"],
+                "oi_period": "1h", "show_micro": False,
+                "label_limit": 5, "show_trade_clusters": False,
+                "show_ema7": False, "show_events": False,
+            }
         if timeframe == "1h":
-            return {"mode": "decision",    "title": "1H Decision",
-                    "oi_period": "15m", "show_micro": False,
-                    "label_limit": 7,   "show_trade_clusters": False}
+            return {
+                "mode": "decision", "title": "1H Decision",
+                "panels": ["price", "derivatives", "volume"],
+                "oi_period": "15m", "show_micro": False,
+                "label_limit": 6, "show_trade_clusters": False,
+                "show_ema7": False, "show_events": False,
+            }
         if timeframe == "15m":
-            return {"mode": "transition",  "title": "15m Transition",
-                    "oi_period": "5m",  "show_micro": False,
-                    "label_limit": 7,   "show_trade_clusters": False}
-        # 5m
-        return     {"mode": "execution",   "title": "5m Execution Context",
-                    "oi_period": "5m",  "show_micro": True,
-                    "label_limit": 5,   "show_trade_clusters": True}
+            return {
+                "mode": "transition", "title": "15m Transition",
+                "panels": ["price", "delta", "volume"],
+                "oi_period": "5m", "show_micro": False,
+                "label_limit": 6, "show_trade_clusters": False,
+                "show_ema7": True, "show_events": True,
+            }
+        return {
+            "mode": "execution", "title": "5m Execution Context",
+            "panels": ["price", "delta", "micro", "volume"],
+            "oi_period": "5m", "show_micro": True,
+            "label_limit": 5, "show_trade_clusters": True,
+            "show_ema7": True, "show_events": True,
+        }
+
+    # ─── event detection engine ─────────────────────────────────────────────
+
+    def _detect_events(
+        self,
+        candles: Sequence[Dict],
+        ref_levels: List[Dict],
+        context: Dict,
+        max_events: int = 8,
+    ) -> List[Dict]:
+        """Detect structural events on the visible candle window.
+
+        Returns list of {"type", "x", "price", "label"} dicts, newest first,
+        capped at max_events.
+        """
+        events: List[Dict] = []
+
+        # --- break / reclaim of tier-1 levels ---
+        tier1 = [lv for lv in ref_levels if int(lv.get("priority", 3)) <= 1]
+        for lv in tier1:
+            lp = float(lv["price"])
+            name = str(lv.get("name", "?"))
+            for i in range(1, len(candles)):
+                prev_c = candles[i - 1]["close"]
+                cur_c = candles[i]["close"]
+                if prev_c >= lp > cur_c:
+                    events.append({
+                        "type": "break", "x": i, "price": candles[i]["low"],
+                        "label": f"break {name}",
+                    })
+                elif prev_c <= lp < cur_c:
+                    events.append({
+                        "type": "reclaim", "x": i, "price": candles[i]["high"],
+                        "label": f"reclaim {name}",
+                    })
+
+        # --- volume spike (> 2x MA20) ---
+        if len(candles) >= 20:
+            vols = [c["volume"] for c in candles]
+            vol_ma = self._ema(vols, 20)
+            for i, (v, m) in enumerate(zip(vols, vol_ma)):
+                if m > 0 and v / m >= 2.0:
+                    events.append({
+                        "type": "vol_spike", "x": i, "price": candles[i]["high"],
+                        "label": "vol spike",
+                    })
+
+        # --- CVD divergence (price new high but CVD not, or vice versa) ---
+        if len(candles) >= 10:
+            closes = [c["close"] for c in candles]
+            deltas = []
+            for c in candles:
+                buy = float(c.get("taker_buy_base", 0))
+                total = float(c.get("volume", 0))
+                deltas.append(buy - (total - buy))
+            if any(d != 0 for d in deltas):
+                cvd = []
+                running = 0.0
+                for d in deltas:
+                    running += d
+                    cvd.append(running)
+                lookback = min(20, len(candles) // 3)
+                for i in range(lookback, len(candles)):
+                    window_p = closes[i - lookback:i + 1]
+                    window_c = cvd[i - lookback:i + 1]
+                    p_max_idx = window_p.index(max(window_p))
+                    c_max_idx = window_c.index(max(window_c))
+                    if (closes[i] == max(window_p) and p_max_idx != c_max_idx
+                            and cvd[i] < max(window_c) * 0.95):
+                        events.append({
+                            "type": "cvd_div", "x": i, "price": candles[i]["high"],
+                            "label": "CVD div",
+                        })
+
+        events.sort(key=lambda e: e["x"], reverse=True)
+        seen_x: set = set()
+        deduped: List[Dict] = []
+        for ev in events:
+            if ev["x"] not in seen_x:
+                deduped.append(ev)
+                seen_x.add(ev["x"])
+            if len(deduped) >= max_events:
+                break
+        return deduped
+
+    def _draw_events(self, ax, events: List[Dict]) -> None:
+        _EVENT_STYLE = {
+            "break":     {"marker": "v", "color": "#d24c36", "va": "top"},
+            "reclaim":   {"marker": "^", "color": "#0f9d58", "va": "bottom"},
+            "vol_spike": {"marker": "D", "color": "#1d5c8b", "va": "bottom"},
+            "cvd_div":   {"marker": "s", "color": "#7b4fa6", "va": "bottom"},
+        }
+        for ev in events:
+            s = _EVENT_STYLE.get(ev["type"], _EVENT_STYLE["break"])
+            ax.plot(ev["x"], ev["price"], marker=s["marker"], color=s["color"],
+                    markersize=6, alpha=0.85, zorder=8)
+            ax.annotate(
+                ev["label"], (ev["x"], ev["price"]),
+                textcoords="offset points",
+                xytext=(0, -10 if s["va"] == "top" else 10),
+                fontsize=6, color=s["color"], ha="center", va=s["va"],
+                alpha=0.85,
+            )
 
     # ─── line series helper ──────────────────────────────────────────────────
 
@@ -522,14 +701,17 @@ class KlineChartGenerator:
                 facecolor=col, edgecolor=col, linewidth=0.7, alpha=0.88,
             ))
 
-        # EMA lines — EMA7 dimmed (background); EMA25/99 are primary guides
-        ema7  = self._ema(closes, 7)
-        ema25 = self._ema(closes, 25)
-        ema99 = self._ema(closes, 99)
-        ax.plot(xs, ema7,  color="#d97706", linewidth=0.85, alpha=0.55,
-                label="EMA7", linestyle="--")
-        ax.plot(xs, ema25, color=_CLR["ema"], linewidth=1.35, label="EMA25")
-        ax.plot(xs, ema99, color="#1f6f8b", linewidth=1.35, label="EMA99")
+        mode = spec.get("mode", "all")
+        if spec.get("show_ema7", True):
+            ema7 = self._ema(closes, 7)
+            ax.plot(xs, ema7, color="#d97706", linewidth=0.85, alpha=0.55,
+                    label="EMA7", linestyle="--")
+        if mode in ("decision", "transition", "all"):
+            ema25 = self._ema(closes, 25)
+            ax.plot(xs, ema25, color=_CLR["ema"], linewidth=1.35, label="EMA25")
+        if mode in ("structure", "decision", "all"):
+            ema99 = self._ema(closes, 99)
+            ax.plot(xs, ema99, color="#1f6f8b", linewidth=1.35, label="EMA99")
 
         current_price = float(context.get("price", closes[-1]))
         vis_low, vis_high = min(lows), max(highs)
@@ -550,19 +732,13 @@ class KlineChartGenerator:
                 ax, context.get("trade_flow", {}), current_price, len(candles), vlo, vhi,
             )
 
-        # Reference levels with zone boxes
-        ref_levels = self._collect_reference_levels(context)
+        ref_levels = self._collect_reference_levels(context, mode=mode)
         self._draw_reference_levels(ax, ref_levels, current_price, vlo, vhi, int(spec["label_limit"]))
 
-        # Session high / low (transition+ charts)
-        if spec["mode"] in ("transition", "execution", "decision"):
-            sc = context.get("session_context", {})
-            for k, color in (("session_high", _CLR["session"]), ("session_low", _CLR["session"])):
-                v = float(sc.get(k, 0) or 0)
-                if v > 0:
-                    ax.axhline(v, color=color, linestyle=":", linewidth=0.8, alpha=0.50)
+        if spec.get("show_events", False):
+            events = self._detect_events(candles, ref_levels, context)
+            self._draw_events(ax, events)
 
-        # Position management lines (only when explicitly requested)
         if position_overlay:
             self._draw_position_lines(ax, context)
 
@@ -583,12 +759,67 @@ class KlineChartGenerator:
         ax.set_ylabel("OI", fontsize=8)
         ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.35)
 
+        # OI flush detection: 3+ consecutive drops with cumulative > 2%
+        if len(oi_pts) >= 4:
+            oi_vals = [float(p.get("open_interest", 0)) for p in oi_pts]
+            oi_xs = [self._timestamp_to_x(int(p.get("timestamp", 0)), candles) for p in oi_pts]
+            streak = 0
+            streak_start = 0
+            for k in range(1, len(oi_vals)):
+                if oi_vals[k] < oi_vals[k - 1]:
+                    if streak == 0:
+                        streak_start = k - 1
+                    streak += 1
+                else:
+                    if streak >= 3:
+                        cum = (oi_vals[streak_start] - oi_vals[k - 1]) / max(oi_vals[streak_start], 1)
+                        if cum > 0.02:
+                            mid_x = oi_xs[(streak_start + k - 1) // 2]
+                            mid_y = oi_vals[(streak_start + k - 1) // 2]
+                            ax.annotate(
+                                "OI flush", (mid_x, mid_y),
+                                fontsize=7, color="#c65d07", fontweight="bold",
+                                ha="center", va="bottom",
+                            )
+                    streak = 0
+
         ratio_hist = (context.get("long_short_ratio", {})
                       .get("global_account", {}).get("history", []))
         ax2 = ax.twinx()
         self._plot_line_series(ax2, candles, ratio_hist, "ratio", "#b56576", "Global L/S")
         ax2.set_ylabel("L/S", fontsize=8, color="#b56576")
         ax2.tick_params(axis="y", labelsize=8, colors="#b56576")
+
+        # L/S crowded detection
+        if len(ratio_hist) >= 5:
+            ratios = [float(r.get("ratio", 1.0)) for r in ratio_hist]
+            r_mean = sum(ratios) / len(ratios)
+            r_var = sum((x - r_mean) ** 2 for x in ratios) / len(ratios)
+            r_std = r_var ** 0.5
+            if r_std > 0:
+                for k, rv in enumerate(ratios):
+                    z = (rv - r_mean) / r_std
+                    if abs(z) >= 1.5:
+                        rx = self._timestamp_to_x(int(ratio_hist[k].get("timestamp", 0)), candles)
+                        ax2.annotate(
+                            "crowded", (rx, rv),
+                            fontsize=6.5, color="#b56576", alpha=0.85,
+                            ha="center", va="bottom",
+                        )
+
+        # Funding rate line
+        funding = context.get("funding", {})
+        fr = funding.get("funding_rate")
+        if fr is not None:
+            fr_pct = float(fr) * 100
+            ax3 = ax.twinx()
+            ax3.spines["right"].set_position(("outward", 45))
+            ax3.axhline(fr_pct, color="#7b4fa6", linewidth=1.2, linestyle="--",
+                        alpha=0.7, label=f"FR {fr_pct:+.4f}%")
+            ax3.axhline(0, color="#7b4fa6", linewidth=0.4, alpha=0.3)
+            ax3.set_ylabel("FR%", fontsize=7, color="#7b4fa6")
+            ax3.tick_params(axis="y", labelsize=7, colors="#7b4fa6")
+
         ll, rl = ax.get_legend_handles_labels()
         lr, rr = ax2.get_legend_handles_labels()
         if ll or lr:
@@ -639,9 +870,27 @@ class KlineChartGenerator:
             ax.legend(ll + lr, rl + rr, loc="upper right", fontsize=7)
 
     def _plot_volume_panel(self, ax, candles: Sequence[Dict]) -> None:
+        volumes = [row["volume"] for row in candles]
         for i, row in enumerate(candles):
             col = "#0f9d58" if row["close"] >= row["open"] else "#d24c36"
             ax.bar(i, row["volume"], color=col, width=0.66, alpha=0.55)
+
+        if len(volumes) >= 20:
+            ma20 = self._ema(volumes, 20)
+            ax.plot(range(len(ma20)), ma20, color="#d97706", linewidth=1.1,
+                    linestyle="--", alpha=0.75, label="Vol MA20")
+            for i, (v, m) in enumerate(zip(volumes, ma20)):
+                if m <= 0:
+                    continue
+                ratio = v / m
+                if ratio >= 1.5:
+                    ax.text(i, v, f"{ratio:.1f}x", fontsize=6, ha="center",
+                            va="bottom", color="#0f9d58", alpha=0.85)
+                elif ratio <= 0.5:
+                    ax.text(i, v, f"{ratio:.1f}x", fontsize=6, ha="center",
+                            va="bottom", color="#d24c36", alpha=0.70)
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.5)
+
         ax.set_ylabel("Vol", fontsize=8)
         ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.30)
         tc   = min(8, len(candles))
@@ -665,12 +914,16 @@ class KlineChartGenerator:
         context: Dict,
         position_overlay: bool = False,
     ) -> None:
-        spec        = self._chart_spec(timeframe)
-        panel_count = 4 if spec["show_micro"] else 3
-        ratios      = [5, 1.4, 1.1, 1.0] if spec["show_micro"] else [5, 1.4, 1.0]
+        spec = self._chart_spec(timeframe)
+        panels = spec.get("panels", ["price", "volume"])
+
+        _PANEL_RATIOS = {"price": 5, "derivatives": 1.4, "delta": 1.1, "micro": 1.0, "volume": 1.0}
+        ratios = [_PANEL_RATIOS.get(p, 1.0) for p in panels]
+        panel_count = len(panels)
+        fig_h = 6 + 1.2 * (panel_count - 1)
         fig, axes = plt.subplots(
             panel_count, 1,
-            figsize=(15, 9 if spec["show_micro"] else 8),
+            figsize=(15, fig_h),
             sharex=True,
             gridspec_kw={"height_ratios": ratios},
         )
@@ -679,20 +932,24 @@ class KlineChartGenerator:
         for a in axes_list:
             a.set_facecolor("#fffdf8")
 
-        self._plot_price_panel(
-            axes_list[0], candles, timeframe, context, spec,
-            position_overlay=position_overlay,
-        )
-        self._plot_derivatives_panel(axes_list[1], candles, context, spec)
-        if spec["show_micro"]:
-            has_taker = any(float(c.get("taker_buy_base", 0)) > 0 for c in candles)
-            if has_taker:
-                self._plot_delta_panel(axes_list[2], candles)
-            else:
-                self._plot_micro_panel(axes_list[2], candles, context)
-            self._plot_volume_panel(axes_list[3], candles)
-        else:
-            self._plot_volume_panel(axes_list[2], candles)
+        for ax, panel_name in zip(axes_list, panels):
+            if panel_name == "price":
+                self._plot_price_panel(
+                    ax, candles, timeframe, context, spec,
+                    position_overlay=position_overlay,
+                )
+            elif panel_name == "derivatives":
+                self._plot_derivatives_panel(ax, candles, context, spec)
+            elif panel_name == "delta":
+                has_taker = any(float(c.get("taker_buy_base", 0)) > 0 for c in candles)
+                if has_taker:
+                    self._plot_delta_panel(ax, candles)
+                else:
+                    self._plot_micro_panel(ax, candles, context)
+            elif panel_name == "micro":
+                self._plot_micro_panel(ax, candles, context)
+            elif panel_name == "volume":
+                self._plot_volume_panel(ax, candles)
 
         plt.tight_layout()
         fig.savefig(output_path, dpi=180, bbox_inches="tight")
@@ -717,7 +974,10 @@ class KlineChartGenerator:
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         chart_files: Dict[str, str] = {}
+        _NO_CHART_TF = {"1d", "1w"}
         for timeframe in self.bars_by_timeframe:
+            if timeframe in _NO_CHART_TF:
+                continue
             candles = list(klines_by_timeframe.get(timeframe, []))
             if not candles:
                 continue
@@ -731,16 +991,32 @@ class KlineChartGenerator:
             chart_files[timeframe] = str(path.resolve())
         return chart_files
 
+    @staticmethod
+    def _rolling_zscore(values: Sequence[float], window: int = 20) -> List[float]:
+        result: List[float] = []
+        for i in range(len(values)):
+            w = values[max(0, i - window + 1):i + 1]
+            if len(w) < 2:
+                result.append(0.0)
+                continue
+            mean = sum(w) / len(w)
+            var = sum((x - mean) ** 2 for x in w) / len(w)
+            std = var ** 0.5
+            result.append((values[i] - mean) / std if std > 0 else 0.0)
+        return result
+
     def generate_spot_perp_chart(
         self,
         symbol: str,
         perp_klines: Sequence[Dict],
         spot_klines: Sequence[Dict],
         output_path: Path,
+        context: Dict | None = None,
     ) -> str | None:
-        """Spot vs perp comparison chart with basis bps and state badge."""
+        """Spot vs perp comparison chart with basis z-score and funding overlay."""
         if not perp_klines or not spot_klines:
             return None
+        ctx = context or {}
 
         perp_sorted = sorted(perp_klines, key=lambda x: x["open_time"])[-120:]
         spot_lookup = {c["open_time"]: float(c["close"]) for c in spot_klines}
@@ -753,14 +1029,15 @@ class KlineChartGenerator:
         ]
 
         fig, axes = plt.subplots(
-            3, 1, figsize=(15, 9), sharex=True,
-            gridspec_kw={"height_ratios": [5, 1.5, 1.0]},
+            4, 1, figsize=(15, 11), sharex=True,
+            gridspec_kw={"height_ratios": [5, 1.5, 1.0, 1.0]},
         )
         fig.patch.set_facecolor("#f8f5f0")
         for a in axes:
             a.set_facecolor("#fffdf8")
 
-        ax_p      = axes[0]
+        # Panel 1: Price
+        ax_p = axes[0]
         body_floor = max(
             (max(c["high"] for c in aligned) - min(c["low"] for c in aligned)) * 0.001, 0.5
         )
@@ -778,11 +1055,19 @@ class KlineChartGenerator:
             ax_p.plot(list(xs), list(ys), color="#457b9d", linewidth=1.6,
                       linestyle="--", label="Spot", alpha=0.9)
 
+        zs = self._rolling_zscore(basis_bps)
+        for i in range(1, len(zs)):
+            if (zs[i - 1] <= 0 < zs[i]) or (zs[i - 1] >= 0 > zs[i]):
+                ax_p.axvline(i, color="#7b4fa6", linewidth=0.8, alpha=0.45, linestyle=":")
+                ax_p.text(i, ax_p.get_ylim()[1], "basis flip", fontsize=6,
+                          ha="center", va="top", color="#7b4fa6", alpha=0.7)
+
         ax_p.set_title(f"{symbol} Spot vs Perp (1H)", fontsize=12, pad=10)
         ax_p.grid(True, linestyle=":", linewidth=0.5, alpha=0.45)
         ax_p.legend(loc="upper left", fontsize=8)
         ax_p.set_xlim(-1, len(aligned) + 2)
 
+        # Panel 2: Basis bps + z-score
         ax_b = axes[1]
         ax_b.bar(range(len(basis_bps)),
                  basis_bps,
@@ -792,7 +1077,30 @@ class KlineChartGenerator:
         ax_b.set_ylabel("Basis bps", fontsize=8)
         ax_b.grid(True, linestyle=":", linewidth=0.5, alpha=0.35)
 
-        ax_v = axes[2]
+        ax_z = ax_b.twinx()
+        ax_z.plot(range(len(zs)), zs, color="#7b4fa6", linewidth=1.2, label="z-score")
+        ax_z.axhline(2, color="#d24c36", linewidth=0.6, linestyle=":", alpha=0.5)
+        ax_z.axhline(-2, color="#d24c36", linewidth=0.6, linestyle=":", alpha=0.5)
+        for i, z in enumerate(zs):
+            if abs(z) >= 2:
+                ax_z.plot(i, z, "o", color="#d24c36", markersize=4, alpha=0.8)
+        ax_z.set_ylabel("z-score", fontsize=8, color="#7b4fa6")
+        ax_z.tick_params(axis="y", labelsize=7, colors="#7b4fa6")
+
+        # Panel 3: Funding rate
+        ax_f = axes[2]
+        funding = ctx.get("funding", {})
+        fr = funding.get("funding_rate")
+        if fr is not None:
+            fr_val = float(fr) * 100
+            ax_f.axhline(fr_val, color="#1d5c8b", linewidth=1.5, label=f"FR {fr_val:+.4f}%")
+            ax_f.axhline(0, color="#888", linewidth=0.6)
+            ax_f.legend(loc="upper left", fontsize=7)
+        ax_f.set_ylabel("Funding %", fontsize=8)
+        ax_f.grid(True, linestyle=":", linewidth=0.5, alpha=0.35)
+
+        # Panel 4: Volume
+        ax_v = axes[3]
         for i, row in enumerate(aligned):
             col = "#0f9d58" if row["close"] >= row["open"] else "#d24c36"
             ax_v.bar(i, row.get("volume", 0), color=col, width=0.66, alpha=0.55)

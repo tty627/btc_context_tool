@@ -18,9 +18,11 @@ try:
         AGG_TRADES_LIMIT, AGG_TRADES_WINDOW_MINUTES,
         AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
+        DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        REPORT_MODE, SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        REPORT_MODE, SUMMARY_FILE, SYMBOL, SYSTEM_PROMPT_FILE,
+        PUSHPLUS_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from .context import MarketContextBuilder
@@ -33,9 +35,11 @@ except ImportError:
         AGG_TRADES_LIMIT, AGG_TRADES_WINDOW_MINUTES,
         AI_ANALYSIS_FILE, BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
         CHART_BARS, CHART_DIR, CONTEXT_FILE, DEPTH_LIMIT, KLINE_LIMIT, LARGE_TRADE_QUANTILE,
+        DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
-        REPORT_MODE, SUMMARY_FILE, SYMBOL, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+        REPORT_MODE, SUMMARY_FILE, SYMBOL, SYSTEM_PROMPT_FILE,
+        PUSHPLUS_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
     from context import MarketContextBuilder
@@ -326,6 +330,7 @@ def build_market_context(
     options_iv = feature_extractor.extract_options_iv_placeholder()
 
     recent_4h_range = feature_extractor.extract_recent_4h_range(klines_by_timeframe.get("15m", []))
+    daily_anchors = feature_extractor.extract_daily_anchors(klines_by_timeframe.get("1d", []))
     profile_tf = "1h" if "1h" in klines_by_timeframe else timeframes[0]
     volume_profile = feature_extractor.extract_volume_profile(
         candles=klines_by_timeframe.get(profile_tf, []),
@@ -369,6 +374,21 @@ def build_market_context(
         trade_flow=trade_flow,
         session_context=session_context,
     )
+
+    ref_levels = deployment_context.get("reference_levels", [])
+    key_level_inputs = [
+        {"name": lv.get("name", "?"), "price": lv.get("price", 0)}
+        for lv in ref_levels
+        if float(lv.get("price", 0)) > 0
+    ]
+    vp = volume_profile
+    poc_price = vp.get("poc_price")
+    if poc_price and float(poc_price) > 0:
+        key_level_inputs.append({"name": "POC", "price": float(poc_price)})
+    trade_flow["key_level_flows"] = feature_extractor.extract_key_level_flows(
+        agg_trades, key_level_inputs,
+    )
+
     context = context_builder.build(
         symbol=symbol,
         price=price,
@@ -390,6 +410,7 @@ def build_market_context(
         volume_profile=volume_profile,
         trade_flow=trade_flow,
         liquidation_heatmap=liquidation_heatmap,
+        daily_anchors=daily_anchors,
         external_drivers=external_data,
         chart_files={},
     )
@@ -428,6 +449,13 @@ def build_market_context(
         okx_oi=okx_oi,
         bybit_oi=bybit_oi,
     )
+    context["transition"] = feature_extractor.extract_transition_features(
+        open_interest_trend=open_interest_trend,
+        basis=basis,
+        funding=funding,
+        trade_flow=trade_flow,
+        spot_perp=context.get("spot_perp", {}),
+    )
 
     if include_charts and chart_generator_cls is not None:
         chart_generator = chart_generator_cls(output_dir=charts_path, bars_by_timeframe=CHART_BARS)
@@ -438,6 +466,7 @@ def build_market_context(
             perp_klines=klines_by_timeframe.get("1h", []),
             spot_klines=spot_klines_1h,
             output_path=spot_perp_path,
+            context=context,
         )
         if sp_result:
             chart_files["spot_perp"] = sp_result
@@ -491,13 +520,15 @@ def _cleanup_alternate_prompt_output(report_path: Path) -> None:
     if not is_default_prompt:
         return
 
-    alternate_prompt_path = report_path.with_name("btc_user_prompt.txt")
-    if alternate_prompt_path == report_path or not alternate_prompt_path.exists():
-        return
-    try:
-        alternate_prompt_path.unlink()
-    except OSError:
-        return
+    stale_names = ["btc_user_prompt.txt", "btc_report.txt"]
+    for name in stale_names:
+        old = report_path.with_name(name)
+        if old == report_path or not old.exists():
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def write_outputs(
@@ -513,15 +544,27 @@ def write_outputs(
     with context_path.open("w", encoding="utf-8") as f:
         json.dump(ai_context, f, ensure_ascii=False, indent=2)
 
-    prompt = PromptGenerator().build(ai_context, report_mode=report_mode)
+    gen = PromptGenerator()
+
+    data_prompt = gen.build(ai_context, report_mode=report_mode, include_instructions=False)
     with report_path.open("w", encoding="utf-8") as f:
-        f.write(prompt)
+        f.write(data_prompt)
     _cleanup_alternate_prompt_output(report_path)
 
-    cn_chars = sum(1 for ch in prompt if "\u4e00" <= ch <= "\u9fff")
-    en_chars = len(prompt) - cn_chars
+    system_path = report_path.with_name(SYSTEM_PROMPT_FILE.name)
+    system_text = gen.ANALYSIS_SYSTEM_PROMPT
+    with system_path.open("w", encoding="utf-8") as f:
+        f.write(system_text)
+
+    total = len(data_prompt) + len(system_text)
+    cn_chars = sum(1 for ch in data_prompt if "\u4e00" <= ch <= "\u9fff")
+    en_chars = len(data_prompt) - cn_chars
     est_tokens = int(cn_chars / 3.5 + en_chars / 4)
-    logger.info("prompt size: %d chars, ~%d tokens (estimate)", len(prompt), est_tokens)
+    logger.info(
+        "output: system=%d chars -> %s  |  data=%d chars (~%d tokens) -> %s",
+        len(system_text), system_path.name,
+        len(data_prompt), est_tokens, report_path.name,
+    )
 
     return ai_context
 
@@ -547,14 +590,34 @@ def _load_ai_advisor():
         return None
 
 
-def _run_ai_analysis(api_key: str, model: str, prompt_text: str) -> str:
+def _run_ai_analysis(api_key: str, model: str, prompt_text: str, base_url: str | None = None) -> str:
     AIAdvisor = _load_ai_advisor()
     if AIAdvisor is None:
         raise RuntimeError("advisor module could not be loaded")
-    advisor = AIAdvisor(api_key=api_key, model=model)
+    advisor = AIAdvisor(api_key=api_key, model=model, base_url=base_url)
     token_est = advisor.estimate_tokens(prompt_text)
     print(f"estimated prompt tokens: ~{token_est}")
     return advisor.analyze(prompt_text)
+
+
+def _send_pushplus(context: Dict, analysis_text: str) -> None:
+    token = os.getenv(PUSHPLUS_TOKEN_ENV, "").strip()
+    if not token:
+        logger.warning("PushPlus skipped: %s not set", PUSHPLUS_TOKEN_ENV)
+        return
+    try:
+        try:
+            from .advisor.pushplus_notifier import PushPlusNotifier
+        except ImportError:
+            from advisor.pushplus_notifier import PushPlusNotifier
+        notifier = PushPlusNotifier(token=token)
+        sent = notifier.send_trade_signal(analysis_text, context)
+        if sent:
+            logger.info("PushPlus trade signal sent to WeChat")
+        else:
+            logger.info("PushPlus skipped: AI decision is wait/hold (no actionable setup)")
+    except Exception as exc:
+        logger.error("PushPlus notification error: %s", exc)
 
 
 def _send_telegram(context: Dict, analysis_text: str = None) -> None:
@@ -703,14 +766,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--auto-analyze",
         action="store_true",
         help=(
-            "Send the generated prompt to OpenAI and write the AI analysis to file. "
-            f"Requires env var {OPENAI_API_KEY_ENV}."
+            "Send the generated prompt to an AI provider for analysis. "
+            f"Requires env var {OPENAI_API_KEY_ENV} (openai) or {DEEPSEEK_API_KEY_ENV} (deepseek)."
         ),
     )
     parser.add_argument(
+        "--ai-provider",
+        default="deepseek",
+        choices=["openai", "deepseek"],
+        help="AI provider for --auto-analyze (default: deepseek)",
+    )
+    parser.add_argument(
         "--ai-model",
-        default=OPENAI_MODEL,
-        help=f"OpenAI model to use for --auto-analyze (default: {OPENAI_MODEL})",
+        default=None,
+        help=(
+            f"Model override for --auto-analyze. "
+            f"Defaults: openai={OPENAI_MODEL}, deepseek={DEEPSEEK_MODEL}"
+        ),
     )
     parser.add_argument(
         "--watch",
@@ -737,6 +809,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help=(
             "Send analysis summary to Telegram. "
             f"Requires env vars {TELEGRAM_BOT_TOKEN_ENV} and {TELEGRAM_CHAT_ID_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--pushplus",
+        action="store_true",
+        help=(
+            "Send trade signals to WeChat via PushPlus. "
+            f"Requires env var {PUSHPLUS_TOKEN_ENV}. "
+            "Only sends when AI produces an actionable setup (not wait)."
+        ),
+    )
+    parser.add_argument(
+        "--smart",
+        action="store_true",
+        help=(
+            "Smart analysis mode: skip AI call when market context hasn't "
+            "changed materially since last analysis. Saves API cost with "
+            "--watch. Falls back to full analysis every ~20 min regardless."
         ),
     )
     return parser.parse_args(argv)
@@ -834,7 +924,8 @@ def _run_once(args: argparse.Namespace) -> int:
             ai_context["summary_files"] = {"overview": str(summary_path.resolve())}
             json.dump(ai_context, f, ensure_ascii=False, indent=2)
     logger.info("context written to %s", context_path)
-    logger.info("report written to %s", report_path)
+    logger.info("data prompt written to %s", report_path)
+    logger.info("system prompt written to %s", report_path.with_name(SYSTEM_PROMPT_FILE.name))
     if args.include_summary:
         logger.info("overview summary written to %s", summary_path)
     if context.get("chart_files"):
@@ -843,23 +934,59 @@ def _run_once(args: argparse.Namespace) -> int:
             logger.info("  %s: %s", timeframe, file_path)
 
     analysis = ""
+    skip_ai = False
     if args.auto_analyze:
-        openai_key = _sanitize_env_credential(os.getenv(OPENAI_API_KEY_ENV))
-        if not openai_key:
-            logger.error("--auto-analyze requires %s to be set", OPENAI_API_KEY_ENV)
-            return 1
-        logger.info("sending prompt to %s for analysis...", args.ai_model)
-        prompt_text = PromptGenerator().build(
-            ai_context, report_mode=args.report_mode, include_instructions=False,
-        )
-        analysis = _run_ai_analysis(openai_key, args.ai_model, prompt_text)
-        analysis_path = _resolve_analysis_path(context_path)
-        analysis_path.parent.mkdir(parents=True, exist_ok=True)
-        analysis_path.write_text(analysis, encoding="utf-8")
-        logger.info("AI analysis written to %s", analysis_path)
-        print("\n" + "=" * 60)
-        print(analysis)
-        print("=" * 60)
+        if args.smart:
+            try:
+                try:
+                    from .advisor.change_detector import ChangeDetector
+                except ImportError:
+                    from advisor.change_detector import ChangeDetector
+                detector = ChangeDetector()
+                should, reasons = detector.should_analyze(context)
+                if should:
+                    logger.info("smart mode: AI triggered — %s", "; ".join(reasons))
+                else:
+                    logger.info("smart mode: no material change, skipping AI call")
+                    skip_ai = True
+            except Exception as exc:
+                logger.warning("smart mode detection failed, running AI anyway: %s", exc)
+
+        if not skip_ai:
+            provider = args.ai_provider
+            if provider == "deepseek":
+                ai_api_key = _sanitize_env_credential(os.getenv(DEEPSEEK_API_KEY_ENV))
+                key_env_name = DEEPSEEK_API_KEY_ENV
+                default_model = DEEPSEEK_MODEL
+                base_url = DEEPSEEK_BASE_URL
+            else:
+                ai_api_key = _sanitize_env_credential(os.getenv(OPENAI_API_KEY_ENV))
+                key_env_name = OPENAI_API_KEY_ENV
+                default_model = OPENAI_MODEL
+                base_url = None
+
+            if not ai_api_key:
+                logger.error("--auto-analyze requires %s to be set", key_env_name)
+                return 1
+            model = args.ai_model or default_model
+            logger.info("sending prompt to %s/%s for analysis...", provider, model)
+            prompt_text = PromptGenerator().build(
+                ai_context, report_mode=args.report_mode, include_instructions=False,
+            )
+            analysis = _run_ai_analysis(ai_api_key, model, prompt_text, base_url=base_url)
+            analysis_path = _resolve_analysis_path(context_path)
+            analysis_path.parent.mkdir(parents=True, exist_ok=True)
+            analysis_path.write_text(analysis, encoding="utf-8")
+            logger.info("AI analysis written to %s", analysis_path)
+            print("\n" + "=" * 60)
+            print(analysis)
+            print("=" * 60)
+
+            if args.smart:
+                try:
+                    detector.save_state(context)
+                except Exception:
+                    pass
 
     if args.html:
         try:
@@ -878,6 +1005,9 @@ def _run_once(args: argparse.Namespace) -> int:
 
     if args.telegram:
         _send_telegram(context, analysis_text=analysis if args.auto_analyze else None)
+
+    if args.pushplus and analysis:
+        _send_pushplus(context, analysis)
 
     return 0
 
