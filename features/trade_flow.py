@@ -1,6 +1,6 @@
 """Trade flow feature extraction: CVD, delta, large trades, aggressor layers."""
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from ._base import FeatureBase
 
@@ -85,7 +85,7 @@ class TradeFlowMixin(FeatureBase):
         coverage_minutes = coverage_seconds / 60
 
         windows: Dict[str, Dict] = {}
-        for label in ("1m", "5m", "15m"):
+        for label in ("1m", "5m", "15m", "30m"):
             seconds = cls._window_seconds(label)
             window_rows = [row for row in rows if int(row.get("timestamp", 0)) >= end_ts - seconds * 1000]
             window_summary = cls._summarize_trade_rows(window_rows, threshold)
@@ -232,3 +232,230 @@ class TradeFlowMixin(FeatureBase):
             "absorption_zones": absorption_zones,
             "cvd_path": cvd_path,
         }
+
+    @staticmethod
+    def extract_kline_flow(klines_1m: Sequence[Dict], windows_bars: Tuple[int, ...] = (30, 60)) -> Dict:
+        """Compute cumulative delta from 1m klines using taker buy volume fields.
+
+        Requires klines with taker_buy_base / taker_buy_quote / quote_volume fields.
+        Returns per-window buy/sell/delta breakdown and CVD trend direction.
+        """
+        candles = [
+            c for c in sorted(list(klines_1m), key=lambda x: x.get("open_time", 0))
+            if float(c.get("volume", 0)) > 0
+        ]
+        if not candles or "taker_buy_base" not in (candles[0] if candles else {}):
+            return {"available": False, "reason": "missing_taker_buy_fields"}
+
+        windows: Dict[str, Dict] = {}
+        for bars in windows_bars:
+            recent = candles[-bars:]
+            if not recent:
+                continue
+            taker_buy_base = sum(float(c.get("taker_buy_base", 0)) for c in recent)
+            taker_sell_base = sum(float(c.get("volume", 0)) - float(c.get("taker_buy_base", 0)) for c in recent)
+            taker_buy_quote = sum(float(c.get("taker_buy_quote", 0)) for c in recent)
+            taker_sell_quote = sum(float(c.get("quote_volume", 0)) - float(c.get("taker_buy_quote", 0)) for c in recent)
+            delta_qty = taker_buy_base - taker_sell_base
+            delta_quote = taker_buy_quote - taker_sell_quote
+
+            running = 0.0
+            cvd_series: List[float] = []
+            for c in recent:
+                b = float(c.get("taker_buy_base", 0))
+                s = float(c.get("volume", 0)) - b
+                running += b - s
+                cvd_series.append(running)
+
+            if len(cvd_series) >= 4:
+                mid = len(cvd_series) // 2
+                avg_first = sum(cvd_series[:mid]) / mid
+                avg_second = sum(cvd_series[mid:]) / len(cvd_series[mid:])
+                if avg_second > avg_first * 1.05:
+                    cvd_trend = "rising"
+                elif avg_second < avg_first * 0.95:
+                    cvd_trend = "falling"
+                else:
+                    cvd_trend = "flat"
+            else:
+                cvd_trend = "unknown"
+
+            label = f"{bars}m" if bars < 60 else f"{bars // 60}h"
+            windows[label] = {
+                "bars": len(recent),
+                "buy_base": round(taker_buy_base, 4),
+                "sell_base": round(taker_sell_base, 4),
+                "delta_qty": round(delta_qty, 4),
+                "buy_quote": round(taker_buy_quote, 2),
+                "sell_quote": round(taker_sell_quote, 2),
+                "delta_quote": round(delta_quote, 2),
+                "direction": "buy" if delta_qty > 0 else "sell" if delta_qty < 0 else "flat",
+                "cvd_trend": cvd_trend,
+            }
+
+        return {"available": True, "windows": windows}
+
+    @classmethod
+    def extract_price_level_delta(
+        cls,
+        trades: Sequence[Dict],
+        window_minutes: int = 20,
+        bin_size: float = 100.0,
+    ) -> Dict:
+        """Compute per-price-bin buy/sell delta (footprint-style) from recent agg_trades.
+
+        Detects stacked imbalance (3+ consecutive bins same side) and absorption zones.
+        Note: agg_trades typically cover only the most recent few minutes of high-activity
+        markets; actual_coverage_minutes reflects true data span.
+        """
+        rows = sorted(list(trades), key=lambda x: int(x.get("timestamp", 0)))
+        if not rows:
+            return {"available": False, "reason": "no_trades"}
+
+        end_ts = int(rows[-1]["timestamp"])
+        cutoff_ts = end_ts - window_minutes * 60 * 1000
+        window_rows = [r for r in rows if int(r.get("timestamp", 0)) >= cutoff_ts]
+        if not window_rows:
+            return {"available": False, "reason": "no_trades_in_window"}
+
+        actual_coverage_minutes = max(0.0, (end_ts - int(window_rows[0]["timestamp"])) / 60000)
+
+        prices = [float(r.get("price", 0)) for r in window_rows if float(r.get("price", 0)) > 0]
+        if not prices:
+            return {"available": False, "reason": "no_valid_prices"}
+        mid_price = sorted(prices)[len(prices) // 2]
+        actual_bin = max(bin_size, mid_price * 0.0015)
+
+        bins: Dict[float, Dict] = {}
+        for row in window_rows:
+            price = float(row.get("price", 0))
+            if price <= 0:
+                continue
+            center = round(round(price / actual_bin) * actual_bin, 2)
+            if center not in bins:
+                bins[center] = {"price": center, "buy": 0.0, "sell": 0.0}
+            q = float(row.get("quote_qty", 0))
+            if row.get("aggressor_side") == "buy":
+                bins[center]["buy"] += q
+            else:
+                bins[center]["sell"] += q
+
+        sorted_bins: List[Dict] = []
+        for b in sorted(bins.values(), key=lambda x: x["price"]):
+            total = b["buy"] + b["sell"]
+            if total <= 0:
+                continue
+            delta = b["buy"] - b["sell"]
+            imb = delta / total
+            sig = "buy_imbalance" if imb >= 0.5 else "sell_imbalance" if imb <= -0.5 else "balanced"
+            sorted_bins.append({
+                "price": b["price"],
+                "buy_quote": round(b["buy"], 2),
+                "sell_quote": round(b["sell"], 2),
+                "delta_quote": round(delta, 2),
+                "imbalance": round(imb, 3),
+                "signal": sig,
+                "total_quote": round(total, 2),
+            })
+
+        # Stacked imbalance: 3+ consecutive bins same direction
+        stacked: List[Dict] = []
+        i = 0
+        while i < len(sorted_bins):
+            sig = sorted_bins[i]["signal"]
+            if sig in ("buy_imbalance", "sell_imbalance"):
+                j = i
+                while j < len(sorted_bins) and sorted_bins[j]["signal"] == sig:
+                    j += 1
+                count = j - i
+                if count >= 3:
+                    stacked.append({
+                        "direction": "buy" if sig == "buy_imbalance" else "sell",
+                        "count": count,
+                        "from_price": sorted_bins[i]["price"],
+                        "to_price": sorted_bins[j - 1]["price"],
+                    })
+                i = j
+            else:
+                i += 1
+
+        # Absorption: high volume but near-balanced (both sides fighting at same level)
+        max_vol = max((b["total_quote"] for b in sorted_bins), default=0.0)
+        vol_threshold = max_vol * 0.35
+        absorption: List[Dict] = [
+            {"price": b["price"], "total_quote": b["total_quote"], "imbalance": b["imbalance"]}
+            for b in sorted_bins
+            if b["total_quote"] >= vol_threshold and abs(b["imbalance"]) < 0.2
+        ]
+
+        top_buy = sorted(
+            [b for b in sorted_bins if b["signal"] == "buy_imbalance"],
+            key=lambda x: abs(x["imbalance"]), reverse=True,
+        )[:3]
+        top_sell = sorted(
+            [b for b in sorted_bins if b["signal"] == "sell_imbalance"],
+            key=lambda x: abs(x["imbalance"]), reverse=True,
+        )[:3]
+
+        return {
+            "available": True,
+            "window_minutes": window_minutes,
+            "actual_coverage_minutes": round(actual_coverage_minutes, 1),
+            "bin_size": round(actual_bin, 2),
+            "total_bins": len(sorted_bins),
+            "stacked_imbalance": stacked,
+            "absorption_zones": absorption,
+            "top_buy_imbalance": [b["price"] for b in top_buy],
+            "top_sell_imbalance": [b["price"] for b in top_sell],
+            "all_bins": sorted_bins,
+        }
+
+    @staticmethod
+    def extract_key_level_flows(
+        trades: Sequence[Dict],
+        key_levels: Sequence[Dict],
+        radius_pct: float = 0.0015,
+    ) -> List[Dict]:
+        """Summarise taker buy/sell around each key level.
+
+        Args:
+            key_levels: list of {"name": str, "price": float}.
+            radius_pct: price radius as fraction (default 0.15 %).
+        """
+        if not trades or not key_levels:
+            return []
+        rows = list(trades)
+        results: List[Dict] = []
+        for kl in key_levels:
+            price = float(kl.get("price", 0))
+            if price <= 0:
+                continue
+            radius = price * radius_pct
+            lo, hi = price - radius, price + radius
+            buy_q, sell_q = 0.0, 0.0
+            for r in rows:
+                rp = float(r.get("price", 0))
+                if lo <= rp <= hi:
+                    q = float(r.get("quote_qty", 0))
+                    if r.get("aggressor_side") == "buy":
+                        buy_q += q
+                    else:
+                        sell_q += q
+            if buy_q + sell_q < 1:
+                continue
+            net = buy_q - sell_q
+            if buy_q + sell_q > 0 and abs(net) / (buy_q + sell_q) < 0.15:
+                tag = "absorbed"
+            elif net > 0:
+                tag = "buy_dominant"
+            else:
+                tag = "sell_dominant"
+            results.append({
+                "name": kl.get("name", "?"),
+                "price": round(price, 1),
+                "buy": round(buy_q, 0),
+                "sell": round(sell_q, 0),
+                "net": round(net, 0),
+                "tag": tag,
+            })
+        return results

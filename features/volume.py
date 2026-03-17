@@ -10,6 +10,9 @@ class VolumeMixin(FeatureBase):
     @staticmethod
     def extract_volume_change(klines_by_timeframe: Dict[str, Sequence[Dict]]) -> Dict[str, Dict]:
         result: Dict[str, Dict] = {}
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+
         for timeframe, candles in klines_by_timeframe.items():
             rows = list(candles)
             if not rows:
@@ -20,24 +23,38 @@ class VolumeMixin(FeatureBase):
                     "delta_pct": 0.0,
                     "avg20_volume": 0.0,
                     "vs_avg20_pct": 0.0,
+                    "bar_closed": True,
                 }
                 continue
 
-            last_volume = rows[-1]["volume"]
-            prev_volume = rows[-2]["volume"] if len(rows) > 1 else 0.0
-            delta_volume = last_volume - prev_volume
+            last_bar = rows[-1]
+            bar_closed = now_ms >= int(last_bar.get("close_time", 0))
+
+            if bar_closed or len(rows) < 3:
+                ref_volume = last_bar["volume"]
+                prev_volume = rows[-2]["volume"] if len(rows) > 1 else 0.0
+                lookback = rows[-20:]
+            else:
+                ref_volume = rows[-2]["volume"]
+                prev_volume = rows[-3]["volume"] if len(rows) > 2 else 0.0
+                lookback = rows[-21:-1] if len(rows) > 21 else rows[:-1]
+
+            if not lookback:
+                lookback = [last_bar]
+
+            delta_volume = ref_volume - prev_volume
             delta_pct = 0.0 if prev_volume <= 0 else delta_volume / prev_volume * 100
-            lookback = rows[-20:]
             avg20 = sum(row["volume"] for row in lookback) / len(lookback)
-            vs_avg20_pct = 0.0 if avg20 <= 0 else (last_volume - avg20) / avg20 * 100
+            vs_avg20_pct = 0.0 if avg20 <= 0 else (ref_volume - avg20) / avg20 * 100
 
             result[timeframe] = {
-                "last_volume": round(last_volume, 6),
+                "last_volume": round(ref_volume, 6),
                 "prev_volume": round(prev_volume, 6),
                 "delta_volume": round(delta_volume, 6),
                 "delta_pct": round(delta_pct, 6),
                 "avg20_volume": round(avg20, 6),
                 "vs_avg20_pct": round(vs_avg20_pct, 6),
+                "bar_closed": bar_closed,
             }
         return result
 

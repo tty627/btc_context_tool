@@ -2,12 +2,14 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, urlopen
+from urllib.request import ProxyHandler
 
 try:
     import httpx
@@ -17,9 +19,19 @@ except ImportError:
     _HAS_HTTPX = False
 
 try:
-    from ..config import BASE_URL, REQUEST_TIMEOUT
+    from httpx_socks import SyncProxyTransport
+
+    _HAS_HTTPX_SOCKS = True
+except ImportError:
+    SyncProxyTransport = None  # type: ignore
+    _HAS_HTTPX_SOCKS = False
+
+try:
+    from ..config import BASE_URL, HTTP_PROXY_ENV, HTTPS_PROXY_ENV, REQUEST_TIMEOUT
 except ImportError:
     from config import BASE_URL, REQUEST_TIMEOUT
+    HTTP_PROXY_ENV = "HTTP_PROXY"
+    HTTPS_PROXY_ENV = "HTTPS_PROXY"
 
 logger = logging.getLogger("btc_context.collector")
 
@@ -68,13 +80,32 @@ class BinanceFuturesCollector:
         self.api_key = self._sanitize_credential(api_key)
         self.api_secret = self._sanitize_credential(api_secret)
         self._cache = _TTLCache(default_ttl=cache_ttl) if cache_ttl > 0 else None
+        self._proxy: Optional[str] = os.environ.get(HTTPS_PROXY_ENV) or os.environ.get(HTTP_PROXY_ENV) or None
+        if self._proxy:
+            logger.info("Using proxy for collector: %s", self._proxy)
+        else:
+            logger.info("No proxy set (set HTTPS_PROXY or HTTP_PROXY to e.g. http://127.0.0.1:10808 to avoid 451)")
         self._httpx_client: Optional[Any] = None
         if _HAS_HTTPX:
-            self._httpx_client = httpx.Client(
+            client_kw: Dict[str, Any] = dict(
                 timeout=httpx.Timeout(timeout, connect=5.0),
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                trust_env=False,
             )
+            if self._proxy:
+                proxy_lower = self._proxy.lower().strip()
+                if proxy_lower.startswith("socks5://") or proxy_lower.startswith("socks5h://"):
+                    if _HAS_HTTPX_SOCKS and SyncProxyTransport is not None:
+                        client_kw["transport"] = SyncProxyTransport.from_url(self._proxy)
+                    else:
+                        logger.warning(
+                            "SOCKS proxy set but httpx-socks not installed; install with: pip install httpx-socks"
+                        )
+                        client_kw["proxy"] = self._proxy
+                else:
+                    client_kw["proxy"] = self._proxy
+            self._httpx_client = httpx.Client(**client_kw)
 
     @staticmethod
     def _sanitize_credential(value: Optional[str]) -> str:
@@ -189,8 +220,9 @@ class BinanceFuturesCollector:
         if params:
             url = f"{url}?{urlencode(params)}"
         request = Request(url, headers=headers or {})
+        opener = build_opener(ProxyHandler({"http": self._proxy, "https": self._proxy})) if self._proxy else build_opener()
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with opener.open(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             try:
@@ -263,6 +295,9 @@ class BinanceFuturesCollector:
                     "close": float(row[4]),
                     "volume": float(row[5]),
                     "close_time": int(row[6]),
+                    "quote_volume": float(row[7]),
+                    "taker_buy_base": float(row[9]),
+                    "taker_buy_quote": float(row[10]),
                 }
             )
         return candles
@@ -403,9 +438,91 @@ class BinanceFuturesCollector:
                 time.sleep(interval_seconds)
         return snapshots
 
-    def get_agg_trades(self, symbol: str, limit: int) -> List[Dict]:
+    def get_agg_trades(
+        self,
+        symbol: str,
+        limit: int = 3000,
+        window_minutes: int = 0,
+    ) -> List[Dict]:
+        """Fetch aggregated trades.
+
+        If *window_minutes* > 0, use time-based pagination to cover the full
+        window (e.g. 30 min) regardless of trade count.  Otherwise fall back to
+        the original count-based approach capped by *limit*.
+        """
         batch_size = min(max(1, limit), 1000)
-        payload = self._get_json("/fapi/v1/aggTrades", {"symbol": symbol, "limit": str(batch_size)})
+
+        if window_minutes > 0:
+            rows = self._fetch_agg_trades_by_time(symbol, window_minutes, batch_size)
+        else:
+            rows = self._fetch_agg_trades_by_count(symbol, limit, batch_size)
+
+        trades: List[Dict] = []
+        for row in rows:
+            price = float(row["p"])
+            qty = float(row["q"])
+            is_buyer_maker = bool(row["m"])
+            trades.append(
+                {
+                    "id": int(row["a"]),
+                    "price": price,
+                    "qty": qty,
+                    "quote_qty": price * qty,
+                    "is_buyer_maker": is_buyer_maker,
+                    "aggressor_side": "sell" if is_buyer_maker else "buy",
+                    "timestamp": int(row["T"]),
+                }
+            )
+        trades.sort(key=lambda t: t["timestamp"])
+        return trades
+
+    # -- internal helpers for aggTrades pagination --
+
+    def _fetch_agg_trades_by_time(
+        self, symbol: str, window_minutes: int, batch_size: int,
+    ) -> list:
+        """Pull aggTrades covering at least *window_minutes* using startTime/endTime."""
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - window_minutes * 60 * 1000
+        all_rows: list = []
+        cursor_start = start_ms
+        max_iterations = 60
+
+        for _ in range(max_iterations):
+            params: Dict[str, str] = {
+                "symbol": symbol,
+                "startTime": str(cursor_start),
+                "endTime": str(now_ms),
+                "limit": str(batch_size),
+            }
+            payload = self._get_json("/fapi/v1/aggTrades", params)
+            if not isinstance(payload, list) or not payload:
+                break
+            all_rows.extend(payload)
+            if len(payload) < batch_size:
+                break
+            last_ts = int(payload[-1]["T"])
+            cursor_start = last_ts + 1
+            if cursor_start >= now_ms:
+                break
+
+        seen: set = set()
+        deduped: list = []
+        for row in all_rows:
+            aid = int(row["a"])
+            if aid not in seen:
+                seen.add(aid)
+                deduped.append(row)
+        return deduped
+
+    def _fetch_agg_trades_by_count(
+        self, symbol: str, limit: int, batch_size: int,
+    ) -> list:
+        """Original count-based aggTrades fetch."""
+        payload = self._get_json(
+            "/fapi/v1/aggTrades",
+            {"symbol": symbol, "limit": str(batch_size)},
+        )
         if not isinstance(payload, list):
             raise RuntimeError(f"unexpected aggTrades payload for {symbol}: {payload}")
 
@@ -423,36 +540,131 @@ class BinanceFuturesCollector:
             )
             if not isinstance(older_payload, list) or not older_payload:
                 break
-
-            older_rows = [row for row in older_payload if int(row["a"]) < earliest_id]
+            older_rows = [r for r in older_payload if int(r["a"]) < earliest_id]
             if not older_rows:
                 break
-
             rows = older_rows + rows
             earliest_id = int(older_rows[0]["a"])
             if earliest_id == 0:
                 break
+        return rows[-limit:]
 
+    # ── Spot market data ─────────────────────────────────────────────────
+
+    _SPOT_BASE_URL = "https://api.binance.com"
+
+    def get_spot_agg_trades(self, symbol: str, limit: int = 1000) -> List[Dict]:
+        """Fetch recent spot market agg trades for CVD comparison."""
+        url = f"{self._SPOT_BASE_URL}/api/v3/aggTrades?symbol={symbol}&limit={min(limit, 1000)}"
+        try:
+            payload = self._get_json_url(url)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
         trades: List[Dict] = []
-        for row in rows[-limit:]:
+        for row in payload:
             price = float(row["p"])
             qty = float(row["q"])
             is_buyer_maker = bool(row["m"])
             trades.append(
                 {
-                    "id": int(row["a"]),
                     "price": price,
                     "qty": qty,
                     "quote_qty": price * qty,
-                    "is_buyer_maker": is_buyer_maker,
-                    # buyer maker=true means aggressive sell, false means aggressive buy
                     "aggressor_side": "sell" if is_buyer_maker else "buy",
                     "timestamp": int(row["T"]),
                 }
             )
-
-        trades.sort(key=lambda row: row["timestamp"])
+        trades.sort(key=lambda x: x["timestamp"])
         return trades
+
+    def get_spot_klines(self, symbol: str, interval: str, limit: int) -> List[Dict]:
+        """Fetch spot market klines including taker buy fields."""
+        url = (
+            f"{self._SPOT_BASE_URL}/api/v3/klines"
+            f"?symbol={symbol}&interval={interval}&limit={min(limit, 1000)}"
+        )
+        try:
+            payload = self._get_json_url(url)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        candles: List[Dict] = []
+        for row in payload:
+            candles.append(
+                {
+                    "open_time": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "close_time": int(row[6]),
+                    "quote_volume": float(row[7]),
+                    "taker_buy_base": float(row[9]),
+                    "taker_buy_quote": float(row[10]),
+                }
+            )
+        return candles
+
+    def get_spot_ticker(self, symbol: str) -> Dict:
+        """Fetch spot 24h ticker for price and volume data."""
+        url = f"{self._SPOT_BASE_URL}/api/v3/ticker/24hr?symbol={symbol}"
+        try:
+            payload = self._get_json_url(url)
+            return {
+                "available": True,
+                "last_price": float(payload.get("lastPrice", 0)),
+                "volume": float(payload.get("volume", 0)),
+                "quote_volume": float(payload.get("quoteVolume", 0)),
+            }
+        except Exception as exc:
+            return {"available": False, "reason": str(exc)}
+
+    # ── Cross-exchange open interest ──────────────────────────────────────
+
+    @staticmethod
+    def _okx_inst_id(symbol: str) -> str:
+        if symbol.endswith("USDT"):
+            return f"{symbol[:-4]}-USDT-SWAP"
+        return symbol
+
+    def get_okx_open_interest(self, symbol: str) -> Dict:
+        """Fetch OKX perpetual swap open interest."""
+        inst_id = self._okx_inst_id(symbol)
+        url = f"https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={inst_id}"
+        try:
+            payload = self._get_json_url(url)
+            code = str(payload.get("code", ""))
+            if code != "0":
+                return {
+                    "available": False, "oi": 0.0,
+                    "reason": f"okx_code={code} msg={payload.get('msg', '')}",
+                }
+            rows = payload.get("data", [])
+            if rows:
+                row = rows[0]
+                oi_val = float(row.get("oi", 0) or 0)
+                oi_ccy = float(row.get("oiCcy", 0) or 0)
+                return {"available": True, "oi": oi_ccy if oi_ccy > 0 else oi_val}
+        except Exception as exc:
+            return {"available": False, "oi": 0.0, "reason": str(exc)}
+        return {"available": False, "oi": 0.0, "reason": "empty_response"}
+
+    def get_bybit_open_interest(self, symbol: str) -> Dict:
+        """Fetch Bybit linear perpetual open interest."""
+        url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5min&limit=1"
+        try:
+            payload = self._get_json_url(url)
+            rows = payload.get("result", {}).get("list", [])
+            if rows:
+                oi = float(rows[0].get("openInterest", 0) or 0)
+                return {"available": True, "oi": oi}
+        except Exception as exc:
+            return {"available": False, "oi": 0.0, "reason": str(exc)}
+        return {"available": False, "oi": 0.0, "reason": "empty_response"}
 
     def get_force_orders(self, symbol: str, limit: int = 100) -> List[Dict]:
         try:
@@ -504,18 +716,23 @@ class BinanceFuturesCollector:
         except Exception as exc:
             data["bybit"] = {"available": False, "funding_rate": 0.0, "reason": str(exc)}
 
-        if symbol.endswith("USDT"):
-            base = symbol[:-4]
-            okx_inst_id = f"{base}-USDT-SWAP"
-        else:
-            okx_inst_id = symbol
+        okx_inst_id = self._okx_inst_id(symbol)
         okx_url = f"https://www.okx.com/api/v5/public/funding-rate?instId={okx_inst_id}"
         try:
             payload = self._get_json_url(okx_url)
-            rows = payload.get("data", [])
-            if rows:
-                funding_rate = float(rows[0].get("fundingRate") or 0.0)
-                data["okx"] = {"available": True, "funding_rate": funding_rate}
+            code = str(payload.get("code", ""))
+            if code != "0":
+                data["okx"] = {
+                    "available": False, "funding_rate": 0.0,
+                    "reason": f"okx_code={code} msg={payload.get('msg', '')}",
+                }
+            else:
+                rows = payload.get("data", [])
+                if rows:
+                    funding_rate = float(rows[0].get("fundingRate") or 0.0)
+                    data["okx"] = {"available": True, "funding_rate": funding_rate}
+                else:
+                    data["okx"] = {"available": False, "funding_rate": 0.0, "reason": "empty_data"}
         except Exception as exc:
             data["okx"] = {"available": False, "funding_rate": 0.0, "reason": str(exc)}
 

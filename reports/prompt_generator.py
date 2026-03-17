@@ -1,268 +1,1623 @@
-from typing import Dict
+"""BTC market data panel — raw_first / anti-bias mode.
+
+report_mode="raw_first"  (default):
+    Only raw facts. No derived interpretations, no directional labels,
+    no signal scores, no plan zones in the main report body.
+
+report_mode="full_debug":
+    Same main report, plus an optional appendix with derived / hypothesis
+    fields (signal_score, deployment_context, plan_zones, state_tags, etc.)
+    that MUST NOT be used to anchor the primary analysis.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+_NA = "unavailable"
+
+
+def _f(val: Any, decimals: int = 2) -> str:
+    """Format float to fixed decimals; return _NA on missing/invalid."""
+    try:
+        return f"{float(val):.{decimals}f}"
+    except (TypeError, ValueError):
+        return _NA
+
+
+def _v(val: Any, default: str = _NA) -> str:
+    """Return str(val), or default if None / empty."""
+    if val is None or val == "" or val == {}:
+        return default
+    return str(val)
 
 
 class PromptGenerator:
-    """Build a concise BTC trading prompt from market context."""
+    """Build a raw-first BTC market data panel for downstream LLM analysis."""
 
-    SYSTEM_PROMPT = (
-        "你是 BTC 永续合约交易助手。基于下方数据，给出可执行的 4h 波段交易计划。\n"
-        "规则：\n"
-        "- 以分批挂单为主，不追市价单\n"
-        "- 目标持仓几小时到半天，目标盈利 2-5%\n"
-        "- 仓位用账户百分比表示，不要建议杠杆倍数\n"
-        "- 结构不清或盈亏比低于 1.5:1 就建议观望\n"
-        "- 不要反问，不要教学，不要免责声明\n"
-        "- 若有持仓数据，必须给出持仓操作建议"
+    # ── Data panel header ─────────────────────────────────────────────────────
+    PANEL_HEADER = (
+        "=== BTC MARKET DATA PANEL ===\n"
+        "输入分为四段。必须按顺序阅读：先读 SECTION 1 + SECTION 2，完成独立判断后，\n"
+        "才允许参考 SECTION 3 / SECTION 4（若存在）。\n"
+        "---"
     )
 
-    OUTPUT_FORMAT = (
-        "严格按以下格式输出：\n"
-        "\n"
-        "【方向】做多 / 做空 / 观望\n"
-        "【市场状态】趋势 / 震荡 / 修正\n"
-        "【信号强度】强 / 中 / 弱\n"
-        "\n"
-        "【分批挂单】\n"
-        "  第1档: 价格=xxx, 仓位=账户xx%\n"
-        "  第2档: 价格=xxx, 仓位=账户xx%\n"
-        "  (可选第3档)\n"
-        "【止损】价格\n"
-        "【止盈】TP1=价格(约x%), TP2=价格(约x%)\n"
-        "【预计等待】大致窗口\n"
-        "\n"
-        "【持仓建议】\n"
-        "  当前状态: 多/空/空仓\n"
-        "  操作: 持有/加仓/减仓x%/移动止损到xxx/平仓\n"
-        "  平仓信号: 什么条件下平仓\n"
-        "\n"
-        "【理由】3-5行，包含：趋势配合、关键位、流动性方向、主要风险\n"
-        "\n"
-        "若观望，挂单写「无」，理由写为什么不做。\n"
-        "持仓建议必须写，空仓也要写「当前空仓，等待入场」。"
-    )
+    # ── Analysis system prompt ────────────────────────────────────────────────
+    ANALYSIS_SYSTEM_PROMPT = """\
+You are a BTC/USDT discretionary-perp market decision engine.
 
-    def build(self, context: Dict) -> str:
-        lines: list[str] = [
-            self.SYSTEM_PROMPT,
+Your job is to read the market independently from raw context first, then output a precise, execution-aware decision for trading or position management.
+
+==================================================
+0. PRIMARY MISSION
+==================================================
+
+Your mission is NOT to blindly produce a trade.
+Your mission is to:
+
+1. Read the market objectively
+2. Determine trend, structure, and tradeability
+3. Decide whether there is an edge
+4. If the user already has a position, manage that position first
+5. Only produce an executable setup if the setup is structurally clean
+
+You must prefer accuracy over activity.
+You must never force a trade just to be helpful.
+No bias toward long or short.
+No bias toward breakout or pullback.
+No bias toward "must trade now".
+
+Pending orders are OPTIONAL, not mandatory.
+
+==================================================
+1. CORE DECISION PRINCIPLES
+==================================================
+
+A. MARKET FIRST
+Always read market structure first, then decide execution.
+Never start from "how to place an order".
+Never reverse-engineer a plan just because a user wants a trade.
+
+B. HIGHER TIMEFRAME DIRECTION, LOWER TIMEFRAME TIMING
+Use 4H and 1H to determine directional bias and structural context.
+Use 15m and 5m only for timing, trigger, confirmation, add/reduce, and execution refinement.
+Lower timeframe weakness alone cannot fully reverse a higher-timeframe bullish structure.
+Lower timeframe strength alone cannot fully reverse a higher-timeframe bearish structure.
+Lower timeframes can only:
+- improve entry timing
+- warn of exhaustion
+- trigger risk reduction
+- confirm or reject execution
+
+C. QUALITY OF EVIDENCE MATTERS
+All evidence is not equal.
+Low-quality data must not determine direction.
+
+D. POSITION-AWARE PRIORITY
+If the user has an open position:
+1. Protect risk
+2. Re-check thesis validity
+3. Decide hold / reduce / exit / add / reverse
+4. Only then discuss fresh setups
+
+E. PENDING ORDERS ARE CONDITIONAL
+Only provide a pending order when the setup is structurally clean enough.
+Do not output a pending plan just to fill a template.
+
+F. PULLBACK LIMIT FIRST, BREAKOUT SECOND
+When searching for executable plans, check in this order:
+1. Is there a clean trend-aligned pullback limit setup?
+2. If not, is there a clean breakout / breakdown trigger setup?
+3. If not, wait.
+
+Do NOT default to breakout orders unless pullback logic is truly inferior.
+
+==================================================
+2. WHAT COUNTS AS A VALID SETUP
+==================================================
+
+A setup is valid only if it has enough structural clarity.
+
+A clean setup should ideally have:
+- clear directional bias
+- clean location in structure
+- clear entry zone
+- clear invalidation
+- clear stop logic
+- clear target path
+- acceptable RR
+- no major contradiction from higher timeframe structure
+
+If these are missing, prefer WAIT.
+
+==================================================
+3. PULLBACK LIMIT LOGIC
+==================================================
+
+You ARE allowed to give a pullback limit order if all of the following are true:
+
+1. It is aligned with 4H/1H structural bias
+2. It sits on a real confluence zone, such as:
+   - EMA cluster
+   - prior breakout/retest area
+   - POC / HVN edge
+   - AVWAP / VWAP reaction band
+   - 4H low / 4H high retest
+   - liquidity sweep + reclaim area
+3. The zone is NOT the middle of a broad range
+4. Stop can be kept reasonably tight and logical
+5. Expected RR is acceptable
+6. The setup is not invalidated by nearby opposing resistance/support overhead
+
+You must still reject pullback limits if the price is sitting in a dirty middle area.
+
+Important:
+- Ban fade-style static limit orders in clear range middle
+- Allow trend-aligned confluence pullback limits near structure edge
+
+==================================================
+4. BREAKOUT / BREAKDOWN TRIGGER LOGIC
+==================================================
+
+Use breakout or breakdown stop-trigger plans only if:
+
+1. Pullback entry is not clean enough
+2. Market is compressed under/over a meaningful level
+3. Trigger level is real, not arbitrary
+4. Post-trigger invalidation is clear
+5. Expected follow-through path exists
+6. It is not simply buying directly into thick resistance or selling directly into thick support
+
+==================================================
+5. QUALITY GATING RULES
+==================================================
+
+These rules are HARD GATES, not soft suggestions.
+
+The DATA_QUALITY section contains pre-computed gate verdicts
+(PASS / FAIL / BLOCKED / DEGRADED). Use them directly; do not re-derive.
+
+A. FLOW COVERAGE GATES
+- If 15m_flow_gate = FAIL:
+  15m delta / tape / aggressor data cannot be primary directional evidence
+- If 30m_flow_gate = FAIL:
+  30m flow can only be secondary context
+- If both flow gates FAIL:
+  do not build a strong narrative from trade flow
+
+B. ORDERBOOK QUALITY GATES
+- If dom_direction_gate = BLOCKED:
+  DOM / walls / spoofing observations cannot determine direction
+  They may only refine execution
+
+C. VOLUME QUALITY GATES
+- If volume_gate = DEGRADED:
+  lower confidence in continuation and breakout quality
+  avoid aggressive market chasing
+
+D. WEAK METRICS
+The following are weak by default unless strongly confirmed:
+- short orderbook observations
+- isolated L/S ratio changes
+- single-window CVD flips
+- extremely short tape bursts
+- any derived "signal score" from external references
+
+==================================================
+6. PHASE A / PHASE B SEPARATION
+==================================================
+
+PHASE A = BLIND MARKET READ
+In Phase A, derive your view independently from raw market context.
+Ignore weak external recommendations, user bias, and pre-labeled plan suggestions.
+
+PHASE B = CALIBRATION / AUDIT
+In Phase B, you may use weak references only to:
+- audit consistency
+- refine entry levels
+- refine stop placement
+- refine target ladder
+- compare with your independently derived zones
+
+Weak references MUST NOT:
+- decide direction
+- override structure
+- force a trade
+- flip a hold into exit or vice versa by themselves
+
+You may use weak references to refine price levels, but never to replace structural judgment.
+
+==================================================
+7. STATE MACHINE
+==================================================
+
+Use these simplified state labels.
+
+A. trend_state
+- trending_up
+- trending_down
+- transition
+- range
+
+B. tradeability
+- high_edge
+- good
+- low_edge
+- not_tradable
+
+C. execution_mode (for no-position cases)
+- market_now
+- limit_pullback
+- stop_trigger
+- wait
+
+D. position_action (for open-position cases)
+- hold
+- reduce
+- exit
+- add
+- reverse
+- hold_and_wait_confirmation
+
+==================================================
+8. ACTION MAPPING BY TRADEABILITY
+==================================================
+
+Map tradeability to execution permissions:
+
+- high_edge:
+  market_now / limit_pullback / stop_trigger are allowed
+- good:
+  prefer limit_pullback or stop_trigger
+  market_now only if location is unusually clean
+- low_edge:
+  no aggressive market order
+  only pending setup or wait
+- not_tradable:
+  wait only
+
+This is a hard preference map, not a loose suggestion.
+
+==================================================
+9. POSITION MANAGEMENT LOGIC
+==================================================
+
+If has_open_position = true:
+
+You must manage the current position first.
+Do NOT behave like the user is flat.
+
+Required order of thinking:
+1. Is the original thesis still valid?
+2. Is current price location favorable or unfavorable for holding?
+3. Should risk be reduced now?
+4. Is add-on justified, or is it forbidden?
+5. What invalidates the current position?
+6. If the current position is bad, should we exit now or only on trigger?
+7. After managing current position, what is the re-entry / reverse watchlist?
+
+Important:
+If the user already has a position, you may still provide future setups,
+but they must appear as secondary watchlist, not the main decision.
+
+==================================================
+10. NO-POSITION LOGIC
+==================================================
+
+If has_open_position = false:
+
+Determine:
+1. Is there a current market order edge?
+2. If no, is there a clean pullback limit setup?
+3. If no, is there a clean trigger setup?
+4. If no, wait.
+
+Never invent both long and short plans unless both are genuinely scenario-valid.
+Do not create fake symmetry.
+
+==================================================
+11. WHEN TO PREFER WAIT
+==================================================
+
+Prefer WAIT if:
+- structure is mixed
+- price is in the middle of a decision band
+- resistance/support is too close
+- stop placement is messy
+- RR is poor
+- breakout quality is weak
+- signal quality is poor
+- current open position already requires cautious management
+- the trade idea depends too much on low-quality evidence
+
+==================================================
+12. OUTPUT STYLE RULES
+==================================================
+
+Always output in Chinese.
+Be concise, analytical, and decisive.
+Do not over-explain basic concepts.
+Do not produce motivational language.
+Do not say "anything can happen".
+Do not hedge excessively.
+
+But also:
+- do not fake certainty
+- do not force execution when evidence is mixed
+- clearly separate structural judgment from execution judgment
+- do not produce vague phrases without concrete follow-up (price + action + time window)
+
+==================================================
+13–14. OUTPUT FORMAT & ANTI-FAILURE RULES
+==================================================
+
+(Moved to the end of the data prompt for better compliance.
+ See OUTPUT_FORMAT_TEMPLATE constant.)
+
+==================================================
+15. FINAL DECISION STANDARD
+==================================================
+
+Your output should feel like this:
+- structurally grounded
+- execution-aware
+- position-aware
+- selective
+- not biased toward activity
+- capable of giving pullback orders when justified
+- capable of giving trigger orders when justified
+- comfortable saying wait when neither is good
+
+The best answer is not the most active answer.
+The best answer is the cleanest decision.
+
+==================================================
+16. CAUSAL ANALYSIS REQUIREMENT
+==================================================
+
+Before outputting any directional judgment, you MUST answer these questions
+in your 【市场状态】market_read section:
+
+A. PRIMARY DRIVER
+- What is driving the current price move?
+- Is it spot-led or perp-led? (check basis, spot_perp delta, funding)
+- Is it passive absorption followed by push, or aggressive taker sweep?
+- Is it trend continuation, exhaustion, or inventory rebalance?
+
+B. FLOW QUALITY
+- Is the move confirmed by taker delta and CVD alignment?
+- Or is it thin-liquidity drift with no real aggressor?
+
+If you cannot identify a clear primary driver, lower tradeability by one tier.
+
+==================================================
+17. EXPLICIT WEIGHT HIERARCHY
+==================================================
+
+When signals conflict, apply this priority order. Higher rank overrides lower.
+
+A. DIRECTION WEIGHT (who decides bias):
+  1. 4H structure (trend + EMA alignment)
+  2. 1H structure
+  3. 1H momentum
+  4. 15m trigger / setup pattern
+  5. 5m flow confirmation
+
+B. EXECUTION WEIGHT (who decides entry quality):
+  1. location (distance to key level + RR)
+  2. risk/reward ratio
+  3. liquidity quality (volume gate + flow gate)
+  4. flow confirmation (CVD, taker delta, key_level_flow)
+
+C. VETO PRIORITY (any single one can block a trade):
+  1. dirty middle position (price inside decision band with no edge)
+  2. thick nearby resistance/support against direction
+  3. volume_gate = DEGRADED on all timeframes
+  4. dom_direction_gate = BLOCKED and flow gates both FAIL
+  5. RR < 1.5
+  6. 15m_flow_gate = FAIL and no kline_flow confirmation
+
+If a conflict between A.1 and A.3 exists (e.g. 4H bullish but 1H momentum_down),
+state: "higher structure holds; lower momentum is tactical warning, not reversal".
+
+==================================================
+18. INFORMATION VALIDITY CLASSIFICATION
+==================================================
+
+You MUST mentally classify each piece of evidence into one of three tiers
+before weighting it. Do not mix tiers in a single argument.
+
+A. STRUCTURAL (valid for hours to days):
+  - 4H/1H trend state
+  - daily anchors (prev_day, week, month levels)
+  - volume profile (POC, HVN, LVN)
+  - weekly VWAP
+  - funding regime (persistently positive/negative over 3+ periods)
+
+B. TACTICAL (valid for 15min to a few hours):
+  - 15m setup pattern
+  - OI trend over 1h
+  - session context (asia/europe/us)
+  - kline flow (30m/1h taker delta)
+  - basis direction
+
+C. EPHEMERAL (valid for < 15 minutes):
+  - orderbook dynamics (DOM walls, spoofing detection)
+  - 1m/5m aggressor layers
+  - real-time CVD path
+  - price-level delta footprint
+  - trade clusters
+
+Rules:
+- If a structural and ephemeral signal conflict, structural wins.
+- If only ephemeral evidence supports a trade, tradeability = low_edge at best.
+- Ephemeral evidence may refine entry timing but cannot establish direction.
+
+==================================================
+19. COUNTERFACTUAL CHECK
+==================================================
+
+After completing your main judgment, you MUST output a counterfactual block
+inside 【偏置审计】:
+
+counterfactual:
+  most_likely_wrong_if: <one specific condition that would invalidate your thesis>
+  switch_action: <what you would do if that condition occurs — e.g. exit / reverse / reduce>
+  weakest_input: <which single data point in your analysis is most likely to mislead you>
+
+This is not optional. Even for "wait" decisions, state what would change your mind.
+
+==================================================
+20. NO-TRADE EXPLANATION STANDARD
+==================================================
+
+When execution_mode = wait, the wait_plan MUST include:
+
+wait_plan:
+  status:
+  what_to_wait_for:
+  missing_element: <direction_confirmation / location_advantage / flow_quality / RR_threshold / structural_clarity>
+  bullish_trigger: <specific price + condition that would create a valid long setup>
+  bearish_trigger: <specific price + condition that would create a valid short setup>
+  re_read_trigger: <what external change should prompt re-running this analysis>
+  invalid_wait: <if this happens, the wait thesis itself is wrong>
+  notes:
+
+"Wait" is not a conclusion — it is an observation plan with concrete re-entry criteria."""
+
+    # ── Output format template (appended to data prompt, not in system) ───
+    OUTPUT_FORMAT_TEMPLATE = """\
+==================================================
+OUTPUT FORMAT — 必须严格按此模板输出
+==================================================
+
+Use DIFFERENT templates depending on whether the user has a position.
+
+--------------------------------------------------
+A. IF NO OPEN POSITION
+--------------------------------------------------
+
+【市场状态】
+trend_state:
+tradeability:
+key_zone:
+multi_tf_alignment:
+market_read:
+
+【证据记分板】
+bullish_evidence:（最多 3 条）
+bearish_evidence:（最多 3 条）
+quality_penalties:（最多 3 条）
+verdict:
+
+【当前动作】
+主结论: <立即开多 / 立即开空 / 挂单待触发 / 等待确认 / 不交易>
+一句话理由:
+confidence:
+decision_logic:
+
+【执行模式】
+execution_mode: <market_now / limit_pullback / stop_trigger / wait>
+why_this_mode:
+why_not_other_modes:
+
+【执行方案】
+Only fill the relevant block(s). Do NOT force all blocks.
+
+If market_now:
+immediate_entry_plan:
+  status:
+  side:
+  entry_zone:
+  stop_loss:
+  invalidation:
+  T0 / T1 / T2:
+  expected_RR:
+  notes:
+
+If limit_pullback:
+pullback_plan:
+  status:
+  side:
+  order_type: limit
+  entry_zone:
+  confluence_reason:
+  stop_loss:
+  invalidation:
+  T0 / T1 / T2:
+  expected_RR:
+  expiry:
+  cancel_if:
+  notes:
+
+If stop_trigger:
+trigger_plan:
+  status:
+  side:
+  order_type: stop-market or stop-limit
+  trigger:
+  entry_zone:
+  stop_loss:
+  invalidation:
+  T0 / T1 / T2:
+  expected_RR:
+  expiry:
+  cancel_if:
+  notes:
+
+If wait:
+wait_plan:
+  status:
+  what_to_wait_for:
+  missing_element: <direction_confirmation / location_advantage / flow_quality / RR_threshold / structural_clarity>
+  bullish_trigger: <specific price + condition>
+  bearish_trigger: <specific price + condition>
+  re_read_trigger: <what change should prompt re-analysis>
+  invalid_wait:
+  notes:
+
+【偏置审计】
+phase_b_result:
+  weak_refs_checked: <yes / no>
+  alignment_with_market_read: <aligned / conflicted / mixed / not_applicable>
+  did_weak_refs_change_decision: <yes / no>
+  audit_note:
+counterfactual:
+  most_likely_wrong_if:
+  switch_action:
+  weakest_input:
+
+【一句人话总结】
+<用最简单的人话总结：现在市场像什么，最该做什么，不该做什么。2-3句。仅翻译前文结论，不得新增判断。>
+
+--------------------------------------------------
+B. IF OPEN POSITION EXISTS
+--------------------------------------------------
+
+【市场状态】
+trend_state:
+tradeability:
+key_zone:
+multi_tf_alignment:
+market_read:
+
+【证据记分板】
+bullish_evidence:（最多 3 条）
+bearish_evidence:（最多 3 条）
+quality_penalties:（最多 3 条）
+verdict:
+
+【持仓主结论】
+current_position:
+thesis_status: <valid / weakening / invalid>
+position_action: <hold / reduce / exit / add / reverse / hold_and_wait_confirmation>
+一句话理由:
+confidence:
+decision_logic:
+
+【持仓处理】
+risk_action:
+reduce_zone:
+add_zone:
+hard_invalidation:
+soft_invalidation:
+exit_trigger:
+hold_conditions:
+reversal_condition:
+time_stop:
+
+【次级观察清单】
+(OPTIONAL. Only for future re-entry / reverse / add-on watchlist. Do not force both sides.)
+watchlist_plan:
+  type:
+  trigger_or_entry_zone:
+  stop_loss:
+  invalidation:
+  target_path:
+  notes:
+
+【偏置审计】
+phase_b_result:
+  weak_refs_checked: <yes / no>
+  alignment_with_market_read: <aligned / conflicted / mixed / not_applicable>
+  did_weak_refs_change_decision: <yes / no>
+  audit_note:
+counterfactual:
+  most_likely_wrong_if:
+  switch_action:
+  weakest_input:
+
+【一句人话总结】
+<用最简单的人话总结：当前仓位该怎么处理，关键价位是什么。2-3句。仅翻译前文结论，不得新增判断。>
+
+==================================================
+STRICT ANTI-FAILURE RULES
+==================================================
+
+1. Do not output a breakout plan just because pullback planning is harder.
+2. Do not output a pullback limit just because the user prefers hanging orders.
+3. Do not generate both long and short pending plans unless the market truly has two valid conditional branches.
+4. Do not let weak references decide bias.
+5. Do not let low-timeframe weakness alone flip a higher-timeframe uptrend into bearish trend_state.
+6. Do not add to a losing position inside a dirty middle area.
+7. Do not market-chase in low_edge conditions.
+8. Do not fill sections with meaningless N/A unless the section is truly not applicable.
+9. With an open position, prioritize position management over fresh trade creativity.
+10. If edge is poor, say wait.
+- stop_loss 必须是具体数字
+- invalidation 必须含具体价位 + 触发行为
+- T0 = 减仓/保本位；T1 = 结构目标；T2 = 延伸目标
+- 减仓 → 必须写减多少
+- 加仓 → 必须写前提 + 价位 + 新保护位"""
+
+    def build(
+        self,
+        context: Dict,
+        report_mode: str = "raw_first",
+        include_instructions: bool = True,
+    ) -> str:
+        """Build the prompt text.
+
+        Args:
+            include_instructions: Prepend ANALYSIS_SYSTEM_PROMPT before the data
+                panel so the prompt is self-contained when pasted manually into
+                any AI.  Set to False when the caller (e.g. --auto-analyze)
+                already sends the prompt as a separate system message.
+        """
+        sections: List[str] = []
+
+        if include_instructions:
+            sections += [
+                "=== ANALYSIS INSTRUCTIONS (请先阅读此段指令，再分析下方数据) ===",
+                "",
+                self.ANALYSIS_SYSTEM_PROMPT,
+                "",
+                "─" * 60,
+                "",
+            ]
+
+        # ── SECTION 1: RAW_FACTS ──────────────────────────────────────────────
+        # Objective market facts only. No derived labels, no directional bias.
+        # AI must complete PHASE A judgment based solely on this section.
+        sections += [
+            self.PANEL_HEADER, "",
+            "╔══════════════════════════════════════════════════════════╗",
+            "║  SECTION 1: RAW_FACTS  (客观市场事实，AI 独立判断依据)      ║",
+            "╚══════════════════════════════════════════════════════════╝",
+        ]
+        sections.append("")
+        sections += self._market_facts(context)
+        sections.append("")
+        sections += self._indicators(context)
+        sections.append("")
+        sections += self._levels(context)
+        sections.append("")
+        sections += self._orderbook(context)
+        sections.append("")
+        sections += self._trade_flow(context)
+        sections.append("")
+        sections += self._derivatives(context)
+        sections.append("")
+        sections += self._transition_dynamics(context)
+        sections.append("")
+        sections += self._spot_vs_perp(context)
+        sections.append("")
+        sections += self._position_facts(context)
+        sections.append("")
+        sections += self._external_drivers(context)
+
+        # ── SECTION 2: DATA_QUALITY ───────────────────────────────────────────
+        # Coverage ratios, staleness flags, spoofing risk. Affects how to weight
+        # SECTION 1 evidence. Must be read before any conclusion.
+        sections += [
             "",
-            self.OUTPUT_FORMAT,
+            "╔══════════════════════════════════════════════════════════╗",
+            "║  SECTION 2: DATA_QUALITY  (数据质量与可靠性约束)            ║",
+            "╚══════════════════════════════════════════════════════════╝",
+        ]
+        sections.append("")
+        sections += self._data_quality(context)
+
+        if report_mode == "full_debug":
+            # ── SECTION 3: DERIVED_SIGNALS (weak reference only) ──────────────
+            # State labels inferred from raw data. May carry directional bias.
+            # Only read AFTER completing independent judgment in PHASE A.
+            # If any field conflicts with SECTION 1, treat it as invalid.
+            sections += [
+                "",
+                "╔══════════════════════════════════════════════════════════╗",
+                "║  SECTION 3: DERIVED_SIGNALS  ⚠ weak_ref_only — 仅在      ║",
+                "║  PHASE A 完成后参考，与 raw facts 冲突时忽略               ║",
+                "╚══════════════════════════════════════════════════════════╝",
+            ]
+            sections.append("")
+            sections += self._derived_signals(context)
+
+            # ── SECTION 4: DEPLOYMENT_HINTS (do not use for direction) ────────
+            # Pre-computed plan zones, entry sides, and deployment scores.
+            # These are hypothesis outputs, NOT ground truth.
+            # Do NOT use these to decide long/short direction.
+            sections += [
+                "",
+                "╔══════════════════════════════════════════════════════════╗",
+                "║  SECTION 4: DEPLOYMENT_HINTS  ⚠ optional_plan_hint —     ║",
+                "║  不得用于决定开仓方向，仅供执行细节参考                    ║",
+                "╚══════════════════════════════════════════════════════════╝",
+            ]
+            sections.append("")
+            sections += self._deployment_hints(context)
+
+        sections += [
             "",
+            "─" * 60,
+            "",
+            self.OUTPUT_FORMAT_TEMPLATE,
         ]
 
-        lines.extend(self._build_snapshot(context))
-        lines.append("")
-        lines.extend(self._build_technicals(context))
-        lines.append("")
-        lines.extend(self._build_microstructure(context))
-        lines.append("")
-        lines.extend(self._build_derivatives_compact(context))
-        lines.append("")
-        lines.extend(self._build_sizing(context))
-        lines.append("")
-        lines.extend(self._build_position_status(context))
+        return "\n".join(sections).strip()
 
-        return "\n".join(lines).strip()
+    # ─── 1. DATA QUALITY ────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_snapshot(ctx: Dict) -> list[str]:
-        price = ctx.get("price", 0)
-        signal = ctx.get("signal_score", {})
-        session = ctx.get("session_context", {})
-        stats = ctx.get("stats_24h", {})
-        r4h = ctx.get("recent_4h_range", {})
-        deploy = ctx.get("deployment_context", {})
-        structure = ctx.get("market_structure", {})
+    def _data_quality(ctx: Dict) -> List[str]:
+        lines = ["=== DATA QUALITY ==="]
 
-        score = signal.get("composite_score", "?")
-        bias = signal.get("bias", "?")
-        strength = signal.get("strength", "?")
+        generated_at = ctx.get("generated_at", _NA)
+        lines.append(f"generated_at: {generated_at}")
+        try:
+            dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+            freshness_sec = round((datetime.now(timezone.utc) - dt).total_seconds())
+            lines.append(f"freshness_sec: {freshness_sec}")
+        except Exception:
+            lines.append(f"freshness_sec: {_NA}")
 
-        trend_parts = [f"{tf}={structure.get(tf, '?')}" for tf in ("4h", "1h", "15m")]
+        tf = ctx.get("trade_flow", {})
+        cov_min = tf.get("coverage_minutes", _NA)
+        trade_count = tf.get("trade_count", _NA)
+        lines.append(f"trade_flow_coverage: {_f(cov_min, 1)}min  trades: {trade_count}")
 
-        lines = [
-            "=== 快照 ===",
-            f"价格: {price}  评分: {score}/100 ({bias}, {strength})",
-            f"趋势: {' | '.join(trend_parts)}",
-            f"24h: high={stats.get('high_price')} low={stats.get('low_price')} chg={stats.get('price_change_percent')}%",
-            f"4h区间: {r4h.get('high')}-{r4h.get('low')} (range {r4h.get('range_pct', 0):.2f}%)",
-            f"Session: {session.get('current_session', '?').upper()} | Funding: {session.get('funding_countdown_label', '?')}",
-        ]
-        if deploy:
+        windows = tf.get("windows", {})
+        w_parts = []
+        for label in ("1m", "5m", "15m", "30m"):
+            w = windows.get(label, {})
+            ratio = w.get("coverage_ratio")
+            if ratio is not None:
+                flag = " [LOW]" if float(ratio) < 0.5 else ""
+                w_parts.append(f"{label}={_f(ratio, 2)}{flag}")
+        if w_parts:
+            lines.append(f"window_coverage_ratio: {' | '.join(w_parts)}")
+
+        # ── HARD GATE VERDICTS ───────────────────────────────────────────
+        _FLOW_THRESHOLDS = {"15m": 0.30, "30m": 0.20}
+        for label, threshold in _FLOW_THRESHOLDS.items():
+            w = windows.get(label, {})
+            ratio = w.get("coverage_ratio")
+            if ratio is not None:
+                r = float(ratio)
+                if r >= threshold:
+                    lines.append(
+                        f"{label}_flow_gate: PASS (cov={_f(r, 2)} >= {threshold})"
+                    )
+                else:
+                    lines.append(
+                        f"{label}_flow_gate: FAIL (cov={_f(r, 2)} < {threshold})"
+                        f" -> {label} flow = secondary only"
+                    )
+            else:
+                lines.append(f"{label}_flow_gate: FAIL (no data)")
+
+        od = ctx.get("orderbook_dynamics", {})
+        snap = od.get("snapshot_count", _NA)
+        dur = od.get("sample_duration_seconds", _NA)
+        lines.append(f"orderbook_samples: {snap}  sample_duration_sec: {_f(dur, 1)}")
+
+        spoof = od.get("spoofing_risk", "unknown")
+        dur_val = float(dur) if dur != _NA else 0.0
+        if dur_val < 20:
             lines.append(
-                f"部署: bias={deploy.get('primary_bias')} "
-                f"state={deploy.get('transition_state')} "
-                f"score={deploy.get('deployment_score')}({deploy.get('deployment_score_value')})"
+                f"dom_direction_gate: BLOCKED (sample_duration={_f(dur_val, 1)}s < 20s)"
+                f" -> DOM cannot determine direction"
             )
+        elif spoof in ("high", "medium"):
+            lines.append(
+                f"dom_direction_gate: BLOCKED (spoofing_risk={spoof})"
+                f" -> DOM cannot determine direction"
+            )
+        else:
+            lines.append(f"dom_direction_gate: PASS (spoofing_risk={spoof})")
+
+        vc = ctx.get("volume_change", {})
+        vol_parts = []
+        for vtf in ("15m", "1h", "4h"):
+            v = vc.get(vtf, {})
+            vs_avg = v.get("vs_avg20_pct")
+            if vs_avg is not None:
+                vol_parts.append(f"{vtf}={_f(vs_avg, 1)}%")
+        any_low = any(
+            float(vc.get(t, {}).get("vs_avg20_pct", 0)) < -30
+            for t in ("15m", "1h", "4h")
+            if vc.get(t, {}).get("vs_avg20_pct") is not None
+        )
+        if any_low:
+            lines.append(
+                f"volume_gate: DEGRADED ({', '.join(vol_parts)})"
+                f" -> lower breakout/continuation confidence"
+            )
+        else:
+            lines.append(f"volume_gate: PASS ({', '.join(vol_parts)})")
+
+        kf = tf.get("kline_flow", {})
+        if not kf.get("available", False):
+            reason = kf.get("reason", "unknown")
+            lines.append(f"kline_flow: unavailable ({reason})")
+        else:
+            lines.append("kline_flow: available")
+
+        sp = ctx.get("spot_perp", {})
+        lines.append(f"spot_perp: {'available' if sp.get('available') else 'unavailable'}")
+
+        cx = ctx.get("cross_exchange_oi", {})
+        lines.append(f"cross_exchange_oi: {cx.get('available_count', 0)}/3 sources")
+
+        acc = ctx.get("account_positions", {})
+        lines.append(f"account_positions: {'available' if acc.get('available') else 'unavailable'}")
+
         return lines
 
-    @staticmethod
-    def _build_technicals(ctx: Dict) -> list[str]:
-        lines = ["=== 技术指标 ==="]
-        for tf, m in ctx.get("timeframes", {}).items():
-            feat = m.get("features", {})
-            ema = m.get("ema", {})
-            rsi = m.get("rsi", {})
-            atr = m.get("atr", {})
-            macd = m.get("macd", {})
-            bb = m.get("bollinger", {})
+    # ─── 2. MARKET FACTS ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _market_facts(ctx: Dict) -> List[str]:
+        lines = ["=== MARKET FACTS ==="]
+
+        price = ctx.get("price", _NA)
+        stats = ctx.get("stats_24h", {})
+        session = ctx.get("session_context", {})
+        r4h = ctx.get("recent_4h_range", {})
+        funding = ctx.get("funding", {})
+
+        lines.append(f"price: {price}")
+        lines.append(
+            f"24h: H={_v(stats.get('high_price'))} "
+            f"L={_v(stats.get('low_price'))} "
+            f"chg={_f(stats.get('price_change_percent'), 3)}%  "
+            f"vol={_f(stats.get('volume'), 0)}BTC"
+        )
+        lines.append(
+            f"session: {_v(session.get('current_session')).upper()}  "
+            f"session_H={_v(session.get('session_high'))}  "
+            f"session_L={_v(session.get('session_low'))}"
+        )
+        lines.append(
+            f"4h_range: H={_v(r4h.get('high'))} "
+            f"L={_v(r4h.get('low'))} "
+            f"range_pct={_f(r4h.get('range_pct'), 3)}%"
+        )
+        lines.append(f"funding_countdown: {_v(session.get('funding_countdown_label'))}")
+        lines.append(f"next_funding_time: {_v(funding.get('next_funding_time'))}")
+
+        return lines
+
+    # ─── 3. INDICATORS ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _indicators(ctx: Dict) -> List[str]:
+        lines = ["=== INDICATORS ==="]
+
+        for tf, m in ctx.get("timeframes", {}).items():
+            rsi = m.get("rsi", {})
+            macd = m.get("macd", {})
+            kdj = m.get("kdj", {})
+            bb = m.get("bollinger", {})
+            atr = m.get("atr", {})
+            ema = m.get("ema", {})
+            vwap = m.get("vwap")
+            lines.append(f"[{tf}]")
+            lines.append(f"  RSI14={_f(rsi.get('14'))}")
             lines.append(
-                f"[{tf}] trend={feat.get('trend', '?')} mom={feat.get('momentum', '?')} | "
-                f"RSI={rsi.get('14', '?')}({rsi.get('state', '')}) div={rsi.get('divergence', 'none')} | "
-                f"MACD_hist={macd.get('hist', '?')} | "
-                f"ATR={atr.get('atr', '?')}({atr.get('atr_pct', '?')}%) | "
-                f"BB%B={bb.get('percent_b', '?')} bw={bb.get('bandwidth', '?')} | "
-                f"EMA7={ema.get('7')} E25={ema.get('25')} E99={ema.get('99')}"
+                f"  MACD: DIF={_f(macd.get('dif'))} DEA={_f(macd.get('dea'))} hist={_f(macd.get('hist'))}"
+            )
+            lines.append(
+                f"  KDJ: K={_f(kdj.get('k'))} D={_f(kdj.get('d'))} J={_f(kdj.get('j'))}"
+            )
+            lines.append(
+                f"  BB: upper={_f(bb.get('upper'), 1)} mid={_f(bb.get('middle'), 1)} "
+                f"lower={_f(bb.get('lower'), 1)}  %B={_f(bb.get('percent_b'))} bw={_f(bb.get('bandwidth'))}"
+            )
+            lines.append(f"  ATR={_f(atr.get('atr'), 1)}  ATR%={_f(atr.get('atr_pct'), 3)}%")
+            lines.append(f"  VWAP={_f(vwap, 1)}")
+            lines.append(
+                f"  EMA7={_f(ema.get('7'), 1)}  EMA25={_f(ema.get('25'), 1)}  EMA99={_f(ema.get('99'), 1)}"
             )
 
+        # Volume profile
         vp = ctx.get("volume_profile", {})
         if vp.get("poc_price"):
-            lines.append(f"VP: POC={vp.get('poc_price')} HVN={vp.get('hvn_prices')} LVN={vp.get('lvn_prices')}")
+            lines.append(
+                f"VP ({_v(vp.get('source_timeframe'))} {_v(vp.get('window_size'))}h):"
+            )
+            lines.append(f"  POC={_f(vp.get('poc_price'), 1)}")
+            lines.append(f"  HVN={[round(p, 1) for p in (vp.get('hvn_prices') or [])]}")
+            lines.append(f"  LVN={[round(p, 1) for p in (vp.get('lvn_prices') or [])]}")
+
+        # Session VP sub-profiles
+        sess_profiles = vp.get("session_profiles", {}).get("profiles", {})
+        for sess, prof in sess_profiles.items():
+            if prof.get("poc_price"):
+                lines.append(
+                    f"  session_{sess}: POC={_f(prof.get('poc_price'), 1)} "
+                    f"H={_v(prof.get('high'))} L={_v(prof.get('low'))}"
+                )
+
+        # Anchored VWAP profiles
+        for ap in vp.get("anchored_profiles", []):
+            lines.append(
+                f"  AVWAP({ap.get('anchor_type')}): "
+                f"anchor_price={_v(ap.get('anchor_price'))} "
+                f"vwap={_f(ap.get('anchored_vwap'), 1)} "
+                f"dist_bps={_f(ap.get('distance_to_vwap_bps'), 2)}"
+            )
+
+        # Volume change vs 20-bar average
+        vc = ctx.get("volume_change", {})
+        vc_parts = []
+        for period in ("5m", "15m", "1h", "4h"):
+            v = vc.get(period, {})
+            if v:
+                vc_parts.append(f"{period}: vs_avg20={_f(v.get('vs_avg20_pct'), 1)}%")
+        if vc_parts:
+            lines.append("vol_vs_avg20: " + "  ".join(vc_parts))
 
         return lines
 
+    # ─── 4. LEVELS (source-labeled, non-directional) ────────────────────────
+
     @staticmethod
-    def _build_microstructure(ctx: Dict) -> list[str]:
-        lines = ["=== 盘口与成交流 ==="]
+    def _levels(ctx: Dict) -> List[str]:
+        lines = ["=== LEVELS (source-labeled, non-directional) ==="]
+
+        deploy = ctx.get("deployment_context", {})
+        ref_levels = deploy.get("reference_levels", [])
+
+        by_role: Dict[str, List[Dict]] = {"support": [], "resistance": [], "neutral": []}
+        for lv in ref_levels:
+            role = str(lv.get("role", "neutral"))
+            by_role.setdefault(role, []).append(lv)
+
+        for role in ("support", "resistance", "neutral"):
+            lvs = by_role.get(role, [])
+            if lvs:
+                lines.append(f"{role}:")
+                for lv in sorted(lvs, key=lambda x: float(x.get("price", 0))):
+                    lines.append(
+                        f"  [{lv.get('source', '?')}] {lv.get('name', '?')} @ {_f(lv.get('price'), 1)}"
+                    )
+
+        # Recent 4h sweep zones (non-directional boundaries)
+        r4h = ctx.get("recent_4h_range", {})
+        high_zone = r4h.get("high_sweep_zone", {})
+        low_zone = r4h.get("low_sweep_zone", {})
+        if high_zone:
+            lines.append(
+                f"zone [range] 4h_high_sweep: "
+                f"{_f(high_zone.get('zone_low'), 1)}-{_f(high_zone.get('zone_high'), 1)}"
+            )
+        if low_zone:
+            lines.append(
+                f"zone [range] 4h_low_sweep: "
+                f"{_f(low_zone.get('zone_low'), 1)}-{_f(low_zone.get('zone_high'), 1)}"
+            )
+
+        da = ctx.get("daily_anchors", {})
+        if da.get("available"):
+            lines.append(f"[daily] prev_day_high: {_f(da.get('prev_day_high'), 1)}")
+            lines.append(f"[daily] prev_day_low: {_f(da.get('prev_day_low'), 1)}")
+            lines.append(f"[daily] weekly_vwap: {_f(da.get('weekly_vwap'), 1)}")
+            lines.append(
+                f"[daily] week_high: {_f(da.get('week_high'), 1)}  "
+                f"week_low: {_f(da.get('week_low'), 1)}"
+            )
+            lines.append(f"[daily] month_open: {_f(da.get('month_open'), 1)}")
+            lines.append(
+                f"[daily] month_high: {_f(da.get('month_high'), 1)}  "
+                f"month_low: {_f(da.get('month_low'), 1)}"
+            )
+
+        return lines
+
+    # ─── 5. ORDERBOOK ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _orderbook(ctx: Dict) -> List[str]:
+        lines = ["=== ORDERBOOK ==="]
 
         ob = ctx.get("orderbook", {})
-        if ob:
-            lines.append(
-                f"盘口: bid_vol={ob.get('bid_volume')} ask_vol={ob.get('ask_volume')} "
-                f"imbalance={ob.get('imbalance')}"
-            )
-            bw = ob.get("bid_wall", {})
-            aw = ob.get("ask_wall", {})
-            if isinstance(bw, dict) and isinstance(aw, dict):
-                lines.append(
-                    f"挂单墙: bid@{bw.get('price')}({bw.get('qty')}) "
-                    f"ask@{aw.get('price')}({aw.get('qty')})"
-                )
+        lines.append(
+            f"bid_vol={_v(ob.get('bid_volume'))}  "
+            f"ask_vol={_v(ob.get('ask_volume'))}  "
+            f"imbalance={_f(ob.get('imbalance'))}"
+        )
+        bw = ob.get("bid_wall", {})
+        aw = ob.get("ask_wall", {})
+        if isinstance(bw, dict):
+            lines.append(f"largest_bid_wall: @{_v(bw.get('price'))} qty={_v(bw.get('qty'))}")
+        if isinstance(aw, dict):
+            lines.append(f"largest_ask_wall: @{_v(aw.get('price'))} qty={_v(aw.get('qty'))}")
 
         od = ctx.get("orderbook_dynamics", {})
         if od:
             lines.append(
-                f"盘口动态: spoofing={od.get('spoofing_risk', '?')} "
-                f"wall_behavior={od.get('wall_behavior', '?')} "
-                f"absorption={od.get('passive_absorption_quote', 0)} "
-                f"pull={od.get('pull_without_trade_quote', 0)}"
+                f"wall_pull_events={od.get('wall_pull_events', _NA)}  "
+                f"wall_add_events={od.get('wall_add_events', _NA)}  "
+                f"wall_absorption_events={od.get('wall_absorption_events', _NA)}  "
+                f"wall_sweep_events={od.get('wall_sweep_events', _NA)}"
             )
+            lines.append(
+                f"avg_wall_lifetime_sec={_f(od.get('avg_wall_lifetime_seconds'), 1)}  "
+                f"max_wall_lifetime_sec={_f(od.get('max_wall_lifetime_seconds'), 1)}  "
+                f"sample_duration={_f(od.get('sample_duration_seconds'), 1)}s  "
+                f"snapshots={od.get('snapshot_count', _NA)}"
+            )
+            lines.append(
+                f"avg_imbalance={_f(od.get('avg_imbalance'), 4)}  "
+                f"max_imbalance={_f(od.get('max_imbalance'), 4)}  "
+                f"min_imbalance={_f(od.get('min_imbalance'), 4)}"
+            )
+            lines.append(
+                f"cancel_to_add_ratio={_f(od.get('cancel_to_add_ratio'), 4)}  "
+                f"pull_vs_fill_ratio={_f(od.get('pull_vs_fill_ratio'), 4)}"
+            )
+            lines.append(
+                f"passive_absorption_quote={_f(od.get('passive_absorption_quote', 0), 0)}  "
+                f"pull_without_trade_quote={_f(od.get('pull_without_trade_quote', 0), 0)}  "
+                f"aggressive_sweep_quote={_f(od.get('aggressive_sweep_quote', 0), 0)}"
+            )
+            lines.append(
+                f"bid add/cancel per_sec: {_f(od.get('bid_add_rate_per_second'), 2)}/{_f(od.get('bid_cancel_rate_per_second'), 2)}  "
+                f"ask add/cancel per_sec: {_f(od.get('ask_add_rate_per_second'), 2)}/{_f(od.get('ask_cancel_rate_per_second'), 2)}"
+            )
+
+            bid_activity = od.get("top_bid_level_activity", [])[:3]
+            ask_activity = od.get("top_ask_level_activity", [])[:3]
+            if bid_activity:
+                lines.append("persistent_bid_levels (top 3):")
+                for lv in bid_activity:
+                    lines.append(
+                        f"  @{lv.get('price')} net={_f(lv.get('net_qty'), 3)}BTC "
+                        f"added={_f(lv.get('added_qty'), 3)} "
+                        f"cancelled={_f(lv.get('cancelled_qty'), 3)} "
+                        f"presence={_f(lv.get('presence_ratio'), 2)}"
+                    )
+            if ask_activity:
+                lines.append("persistent_ask_levels (top 3):")
+                for lv in ask_activity:
+                    lines.append(
+                        f"  @{lv.get('price')} net={_f(lv.get('net_qty'), 3)}BTC "
+                        f"added={_f(lv.get('added_qty'), 3)} "
+                        f"cancelled={_f(lv.get('cancelled_qty'), 3)} "
+                        f"presence={_f(lv.get('presence_ratio'), 2)}"
+                    )
+
+        return lines
+
+    # ─── 6. TRADE FLOW ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _trade_flow(ctx: Dict) -> List[str]:
+        lines = ["=== TRADE FLOW ==="]
 
         tf = ctx.get("trade_flow", {})
-        if tf:
-            w5 = tf.get("windows", {}).get("5m", {})
+        if not tf:
+            lines.append(_NA)
+            return lines
+
+        lines.append(
+            f"total: buy={_f(tf.get('buy_quote', 0), 0)} "
+            f"sell={_f(tf.get('sell_quote', 0), 0)} "
+            f"delta={_f(tf.get('delta_quote', 0), 0)}  "
+            f"coverage={_f(tf.get('coverage_minutes'), 1)}min"
+        )
+
+        windows = tf.get("windows", {})
+        for label in ("1m", "5m", "15m", "30m"):
+            w = windows.get(label, {})
+            if not w:
+                continue
+            ratio = w.get("coverage_ratio", 1.0)
+            cov_flag = " [LOW_COV]" if float(ratio) < 0.5 else ""
             lines.append(
-                f"成交流(5m): buy={w5.get('buy_quote', 0):.0f} sell={w5.get('sell_quote', 0):.0f} "
-                f"delta={w5.get('delta_quote', 0):.0f} cvd={w5.get('cvd_qty', 0):.3f} "
-                f"大单={w5.get('large_trade_direction', tf.get('large_trade_direction', '?'))}"
+                f"{label}: buy={_f(w.get('buy_quote', 0), 0)} "
+                f"sell={_f(w.get('sell_quote', 0), 0)} "
+                f"delta={_f(w.get('delta_quote', 0), 0)}  "
+                f"cov={_f(ratio, 2)}{cov_flag}"
             )
-            clusters = tf.get("large_trade_clusters", [])
-            if clusters:
-                top = clusters[0]
+
+        # Aggressor layers (raw buy/sell per size bucket)
+        al = tf.get("aggressor_layers", {})
+        if al:
+            lines.append("aggressor_layers:")
+            for bucket in ("small", "medium", "large", "block"):
+                b = al.get(bucket, {})
+                if b:
+                    lines.append(
+                        f"  {bucket}: buy={_f(b.get('buy_quote', 0), 0)} "
+                        f"sell={_f(b.get('sell_quote', 0), 0)} "
+                        f"delta={_f(b.get('delta_quote', 0), 0)}"
+                    )
+
+        # Kline-based delta (if taker_buy_base is available)
+        kf = tf.get("kline_flow", {})
+        if kf.get("available"):
+            for label in ("30m", "1h"):
+                w = kf.get("windows", {}).get(label, {})
+                if w:
+                    lines.append(
+                        f"kline_{label}: buy={_f(w.get('buy_base', 0), 2)}BTC "
+                        f"sell={_f(w.get('sell_base', 0), 2)}BTC "
+                        f"delta={_f(w.get('delta_qty', 0), 2)}BTC"
+                    )
+
+        # Large trade clusters (raw buy/sell volumes only)
+        clusters = tf.get("large_trade_clusters", [])
+        if clusters:
+            lines.append("large_trade_clusters (top 4):")
+            for c in clusters[:4]:
                 lines.append(
-                    f"最大聚集: price={top.get('center_price')} "
-                    f"quote={top.get('total_quote', 0):.0f} "
-                    f"side={top.get('dominant_side', '?')}"
+                    f"  @{c.get('center_price')} "
+                    f"buy={_f(c.get('buy_quote', 0), 0)} "
+                    f"sell={_f(c.get('sell_quote', 0), 0)} "
+                    f"total={_f(c.get('total_quote', 0), 0)}  "
+                    f"n={c.get('trade_count')}"
                 )
 
-        liq = ctx.get("liquidation_heatmap", {})
-        zones = liq.get("zones", [])
-        near_zones = [z for z in zones if "recent_4h" in str(z.get("name", ""))]
-        if near_zones:
-            lines.append("近端流动性:")
-            for z in near_zones:
+        # Price level delta (footprint-style)
+        pld = tf.get("price_level_delta", {})
+        if pld.get("available"):
+            cov = pld.get("actual_coverage_minutes", 0)
+            bin_sz = pld.get("bin_size", 0)
+            cov_flag = " [LOW_COV]" if float(cov) < 5 else ""
+            lines.append(
+                f"price_level_delta: coverage={_f(cov, 1)}min{cov_flag} bin={_f(bin_sz, 0)}"
+            )
+            for z in pld.get("absorption_zones", []):
                 lines.append(
-                    f"  {str(z.get('name', '')).replace('_', ' ')}: "
-                    f"{z.get('zone_low')}-{z.get('zone_high')} "
-                    f"({z.get('estimated_pressure', '?')})"
+                    f"  high_vol_balanced_zone: price={z.get('price')} "
+                    f"total={_f(z.get('total_quote', 0), 0)} "
+                    f"imbalance={_f(z.get('imbalance'), 3)}"
+                )
+            for s in pld.get("stacked_imbalance", []):
+                lines.append(
+                    f"  consecutive_one_side ({s['count']} bins): "
+                    f"{s['from_price']}-{s['to_price']}  "
+                    f"buy_dominant={s['direction'] == 'buy'}"
+                )
+            all_imb = sorted(
+                pld.get("top_buy_imbalance", []) + pld.get("top_sell_imbalance", [])
+            )
+            if all_imb:
+                lines.append(f"  high_imbalance_price_bins: {all_imb}")
+
+        klf = tf.get("key_level_flows", [])
+        if klf:
+            lines.append("key_level_flow:")
+            for kl in klf:
+                lines.append(
+                    f"  @{kl['price']}({kl['name']}): "
+                    f"buy={_f(kl.get('buy', 0), 0)} "
+                    f"sell={_f(kl.get('sell', 0), 0)} "
+                    f"net={_f(kl.get('net', 0), 0)} -> {kl.get('tag', '?')}"
                 )
 
         return lines
 
+    # ─── 7. DERIVATIVES ─────────────────────────────────────────────────────
+
     @staticmethod
-    def _build_derivatives_compact(ctx: Dict) -> list[str]:
-        lines = ["=== 衍生品 ==="]
+    def _derivatives(ctx: Dict) -> List[str]:
+        lines = ["=== DERIVATIVES ==="]
 
         funding = ctx.get("funding", {})
+        basis = ctx.get("basis", {})
+        lines.append(f"funding_rate: {_v(funding.get('funding_rate'))}")
+        lines.append(f"next_funding: {_v(funding.get('next_funding_time'))}")
         lines.append(
-            f"费率: {funding.get('funding_rate')} | "
-            f"mark={funding.get('mark_price')} index={funding.get('index_price')}"
+            f"mark_price={_f(funding.get('mark_price'), 1)}  "
+            f"index_price={_f(funding.get('index_price'), 1)}"
+        )
+        lines.append(
+            f"basis_abs={_f(basis.get('basis_abs'), 2)}  "
+            f"basis_bps={_f(basis.get('basis_bps'), 2)}"
         )
 
-        basis = ctx.get("basis", {})
-        lines.append(f"基差: {basis.get('basis_bps', 0):.1f}bps ({basis.get('structure', '?')})")
-
+        # OI — raw values + per-period breakdown
         oi = ctx.get("open_interest_trend", {})
         lines.append(
-            f"OI: {ctx.get('open_interest')} "
-            f"trend={oi.get('trend', '?')} delta={oi.get('delta_pct', '?')}% "
-            f"state={oi.get('latest_state', '?')} ({oi.get('latest_interpretation', '?')})"
+            f"OI_current={_v(ctx.get('open_interest'))}  "
+            f"delta%={_f(oi.get('delta_pct'), 3)}  "
+            f"vs_avg%={_f(oi.get('vs_avg_pct'), 3)}"
         )
-        voc = oi.get("volume_oi_cvd_state", {})
-        if isinstance(voc, dict) and voc:
-            lines.append(
-                f"OI综合: vol={voc.get('volume_state', '?')} "
-                f"oi={voc.get('oi_state', '?')} cvd={voc.get('cvd_state', '?')}"
-            )
+        for period in ("5m", "15m", "1h"):
+            p = oi.get("periods", {}).get(period, {})
+            if p:
+                lines.append(
+                    f"  OI_{period}: delta={_f(p.get('delta_abs'), 1)}  "
+                    f"delta%={_f(p.get('delta_pct'), 3)}  "
+                    f"vs_avg%={_f(p.get('vs_avg_pct'), 3)}"
+                )
 
+        # Long/short ratios — raw numbers only, no crowding/momentum label
         ls = ctx.get("long_short_ratio", {})
         ga = ls.get("global_account", {})
         tt = ls.get("top_trader_position", {})
         lines.append(
-            f"多空: global={ga.get('latest_ratio', '?')} "
-            f"top={tt.get('latest_ratio', '?')} "
-            f"crowding={ls.get('overall_crowding', '?')}"
+            f"global_L/S: ratio={_f(ga.get('latest_ratio'))}  "
+            f"long%={_f(ga.get('long_account'), 4)}  "
+            f"short%={_f(ga.get('short_account'), 4)}  "
+            f"avg={_f(ga.get('avg_ratio'))}  delta%={_f(ga.get('delta_pct'), 2)}"
+        )
+        lines.append(
+            f"top_trader_L/S: ratio={_f(tt.get('latest_ratio'))}  "
+            f"long%={_f(tt.get('long_account'), 4)}  "
+            f"short%={_f(tt.get('short_account'), 4)}  "
+            f"avg={_f(tt.get('avg_ratio'))}  delta%={_f(tt.get('delta_pct'), 2)}"
         )
 
+        # Cross-exchange OI
+        cx = ctx.get("cross_exchange_oi", {})
+        src = cx.get("sources", {})
+        oi_parts = []
+        for ex in ("binance", "okx", "bybit"):
+            s = src.get(ex, {})
+            if s.get("available"):
+                oi_parts.append(f"{ex}={_v(s.get('oi'))}{s.get('unit', '')}")
+            else:
+                oi_parts.append(f"{ex}=unavailable")
+        lines.append("cross_exchange_OI: " + " | ".join(oi_parts))
+
+        # Cross-exchange funding rates (raw)
+        cef = ctx.get("cross_exchange_funding", {})
+        cf_parts = []
+        for ex in ("binance", "bybit", "okx"):
+            e = cef.get(ex, {})
+            if e.get("available"):
+                cf_parts.append(f"{ex}={e.get('funding_rate')}")
+            else:
+                cf_parts.append(f"{ex}=unavailable")
+        if cf_parts:
+            lines.append("cross_exchange_funding_rate: " + " | ".join(cf_parts))
+
+        # Funding spread (raw bps only)
         spread = ctx.get("funding_spread", {})
         if spread.get("available_count", 0) >= 2:
             lines.append(
-                f"跨所费率差: {spread.get('max_spread_bps', 0):.2f}bps "
-                f"({spread.get('signal', '?')})"
+                f"funding_spread: {_f(spread.get('max_spread_bps'), 4)}bps  "
+                f"({spread.get('highest_exchange')} vs {spread.get('lowest_exchange')})"
             )
 
         return lines
 
-    @staticmethod
-    def _build_sizing(ctx: Dict) -> list[str]:
-        sizing = ctx.get("position_sizing", {})
-        if not sizing or not sizing.get("available"):
-            return []
-        ref = sizing.get("reference_levels", {})
-        lr = ref.get("long", {})
-        sr = ref.get("short", {})
-        return [
-            "=== ATR仓位参考 ===",
-            f"ATR({sizing.get('atr_timeframe')})={sizing.get('atr')} SL距离={sizing.get('sl_distance')} SL%={sizing.get('sl_pct')}",
-            f"做多: SL={lr.get('stop_loss')} TP1={lr.get('tp1')} TP2={lr.get('tp2')}",
-            f"做空: SL={sr.get('stop_loss')} TP1={sr.get('tp1')} TP2={sr.get('tp2')}",
-        ]
+    # ─── 7b. TRANSITION DYNAMICS ────────────────────────────────────────────
 
     @staticmethod
-    def _build_position_status(ctx: Dict) -> list[str]:
+    def _transition_dynamics(ctx: Dict) -> List[str]:
+        lines = ["=== TRANSITION DYNAMICS (change rates & regime shifts) ==="]
+        tr = ctx.get("transition", {})
+        if not tr:
+            lines.append("transition_data: unavailable")
+            return lines
+
+        oi = tr.get("oi_rates", {})
+        for period in ("5m", "15m", "1h"):
+            r = oi.get(period, {})
+            lines.append(
+                f"OI_{period}: delta%={_f(r.get('delta_pct'), 4)}  "
+                f"velocity={_f(r.get('velocity'), 1)}  "
+                f"acceleration={_f(r.get('acceleration'), 1)}"
+            )
+
+        bd = tr.get("basis_dynamics", {})
+        lines.append(
+            f"basis: {_f(bd.get('basis_bps'), 2)}bps  regime={_v(bd.get('regime'))}"
+        )
+
+        fd = tr.get("funding_dynamics", {})
+        lines.append(
+            f"funding: rate={_f(fd.get('rate_pct'), 4)}%  "
+            f"regime={_v(fd.get('regime'))}  intensity={_v(fd.get('intensity'))}"
+        )
+
+        cd = tr.get("cvd_dynamics", {})
+        lines.append(
+            f"CVD: slope_5m={_f(cd.get('slope_5m'), 4)}  "
+            f"slope_15m={_f(cd.get('slope_15m'), 4)}  "
+            f"momentum={_v(cd.get('momentum'))}"
+        )
+
+        return lines
+
+    # ─── 8. SPOT VS PERP ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _spot_vs_perp(ctx: Dict) -> List[str]:
+        sp = ctx.get("spot_perp", {})
+        if not sp.get("available"):
+            return ["=== SPOT VS PERP ===", _NA]
+
+        lines = ["=== SPOT VS PERP ==="]
+        lines.append(
+            f"spot_price={_v(sp.get('spot_price'))}  perp_price={_v(sp.get('perp_price'))}"
+        )
+        lines.append(
+            f"basis_abs={_f(sp.get('basis_abs'), 2)}  "
+            f"basis_bps={_f(sp.get('basis_bps'), 2)}"
+        )
+        s5 = sp.get("spot_5m", {})
+        s15 = sp.get("spot_15m", {})
+        lines.append(
+            f"spot_5m: buy={_f(s5.get('buy_quote', 0), 0)} "
+            f"sell={_f(s5.get('sell_quote', 0), 0)} "
+            f"delta={_f(s5.get('delta_quote', 0), 0)}"
+        )
+        lines.append(
+            f"spot_15m: buy={_f(s15.get('buy_quote', 0), 0)} "
+            f"sell={_f(s15.get('sell_quote', 0), 0)} "
+            f"delta={_f(s15.get('delta_quote', 0), 0)}"
+        )
+        lines.append(f"spot_vol_24h_quote={_f(sp.get('spot_vol_24h_quote', 0), 0)}")
+        lines.append(f"spot_cvd_qty={_f(sp.get('spot_cvd_qty'), 4)}")
+
+        return lines
+
+    # ─── 9. POSITION FACTS ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _position_facts(ctx: Dict) -> List[str]:
+        lines = ["=== POSITION FACTS ==="]
+
         acc = ctx.get("account_positions", {})
         if not acc.get("available"):
-            return ["=== 持仓 ===", "仓位数据不可用，按空仓处理"]
+            lines.append("has_open_position: unavailable")
+            return lines
 
         sym = acc.get("symbol_position")
-        active_count = acc.get("active_positions_count", 0)
+        if not sym or abs(float(sym.get("position_amt", 0) or 0)) == 0:
+            lines.append("has_open_position: false")
+            sizing = ctx.get("position_sizing", {})
+            if sizing and sizing.get("available"):
+                lines.append(
+                    f"ATR_ref: ATR({_v(sizing.get('atr_timeframe'))})={_f(sizing.get('atr'), 1)}  "
+                    f"1.5xATR_dist={_f(sizing.get('sl_distance'), 1)}  "
+                    f"ATR%={_f(sizing.get('sl_pct'), 3)}%"
+                )
+            return lines
 
-        if not sym or abs(float(sym.get("position_amt", 0))) == 0:
-            return ["=== 持仓 ===", "当前空仓"]
+        notional = abs(float(sym.get("notional", 0) or 0))
+        lines.append("has_open_position: true")
+        lines.append(f"side: {_v(sym.get('side'))}")
+        lines.append(f"size_btc: {_v(sym.get('position_amt'))}")
+        lines.append(f"entry_price: {_v(sym.get('entry_price'))}")
+        lines.append(f"mark_price: {_v(sym.get('mark_price'))}")
+        lines.append(f"leverage: {_v(sym.get('leverage'))}x")
+        lines.append(f"liquidation_price: {_v(sym.get('liquidation_price'))}")
+        lines.append(f"unrealized_pnl: {_v(sym.get('unrealized_pnl'))}")
+        lines.append(f"notional_usdt: {notional:.2f}")
+        lines.append(f"margin_type: {_v(sym.get('margin_type'))}")
 
-        side = sym.get("side", "?")
-        amt = sym.get("position_amt", 0)
-        entry = sym.get("entry_price", 0)
-        mark = sym.get("mark_price", 0)
-        liq = sym.get("liquidation_price", 0)
-        pnl = sym.get("unrealized_pnl", 0)
-        lev = sym.get("leverage", 0)
-        notional = abs(float(sym.get("notional", 0)))
+        # ATR reference — raw distance only, no directional label
+        sizing = ctx.get("position_sizing", {})
+        if sizing and sizing.get("available"):
+            lines.append(
+                f"ATR_ref: ATR({_v(sizing.get('atr_timeframe'))})={_f(sizing.get('atr'), 1)}  "
+                f"1.5xATR_dist={_f(sizing.get('sl_distance'), 1)}  "
+                f"ATR%={_f(sizing.get('sl_pct'), 3)}%"
+            )
 
-        return [
-            "=== 持仓 ===",
-            f"方向={side} 数量={amt} 杠杆={lev}x",
-            f"开仓价={entry} 标记价={mark} 强平价={liq}",
-            f"持仓价值={notional:.2f}U 未实现盈亏={pnl}",
-            f"（AI 必须基于此持仓给出：持有/加仓/减仓/调止损/平仓建议）",
-        ]
+        return lines
+
+    # ─── EXTERNAL DRIVERS ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _external_drivers(ctx: Dict) -> List[str]:
+        lines = ["=== EXTERNAL DRIVERS ==="]
+        ext = ctx.get("external_drivers", {})
+        if not ext:
+            lines.append("external_data: unavailable")
+            return lines
+
+        fg = ext.get("fear_greed", {})
+        if fg.get("available"):
+            lines.append(
+                f"fear_greed_index: {fg.get('value', 'N/A')} "
+                f"({fg.get('classification', '')})"
+            )
+        else:
+            lines.append(f"fear_greed_index: unavailable ({fg.get('reason', '')})")
+
+        oc = ext.get("onchain", {})
+        if oc.get("available"):
+            lines.append(
+                f"hashrate: {oc.get('hash_rate_th', 'N/A')} TH/s  "
+                f"difficulty: {oc.get('difficulty', 'N/A')}"
+            )
+            lines.append(
+                f"avg_block_interval: {oc.get('minutes_between_blocks', 'N/A')} min  "
+                f"blocks_mined_24h: {oc.get('n_blocks_mined_24h', 'N/A')}"
+            )
+            lines.append(
+                f"total_btc_sent_24h: {oc.get('total_btc_sent_24h', 'N/A')} BTC"
+            )
+        else:
+            lines.append(f"onchain: unavailable ({oc.get('reason', '')})")
+
+        mp = ext.get("mempool", {})
+        if mp.get("available"):
+            lines.append(
+                f"mempool: {mp.get('count', 0)} txs  "
+                f"vsize={mp.get('vsize_bytes', 0)}  "
+                f"total_fee={mp.get('total_fee_btc', 0)} BTC"
+            )
+        else:
+            lines.append(f"mempool: unavailable ({mp.get('reason', '')})")
+
+        fees = ext.get("fees", {})
+        if fees.get("available"):
+            lines.append(
+                f"fee_sat_vB: fastest={fees.get('fastest_fee', 'N/A')} "
+                f"30min={fees.get('half_hour_fee', 'N/A')} "
+                f"1h={fees.get('hour_fee', 'N/A')} "
+                f"econ={fees.get('economy_fee', 'N/A')}"
+            )
+
+        da = ext.get("difficulty_adjustment", {})
+        if da.get("available"):
+            lines.append(
+                f"diff_epoch: progress={da.get('progress_pct', 'N/A')}%  "
+                f"est_change={da.get('difficulty_change_pct', 'N/A')}%  "
+                f"remaining_blocks={da.get('remaining_blocks', 'N/A')}"
+            )
+
+        etf = ext.get("etf_flow", {})
+        if etf.get("available"):
+            flow = etf.get("total_net_flow_usd", 0)
+            lines.append(
+                f"btc_etf_flow: date={etf.get('date', 'N/A')}  "
+                f"net_flow=${flow:,.0f}"
+            )
+        else:
+            lines.append(f"btc_etf_flow: unavailable ({etf.get('reason', '')})")
+
+        return lines
+
+    # ─── [SECTION 3] DERIVED_SIGNALS (weak reference only) ──────────────────
+
+    @staticmethod
+    def _derived_signals(ctx: Dict) -> List[str]:
+        """State labels inferred from raw data.  All prefixed weak_ref_ to
+        signal that these MUST NOT anchor the primary direction judgment."""
+        lines = ["=== weak_ref: DERIVED_SIGNALS ==="]
+
+        # OI derived state labels (e.g. new_longs / new_shorts)
+        oi = ctx.get("open_interest_trend", {})
+        lines.append(f"weak_ref_OI_composite_signal: {_v(oi.get('composite_signal'))}")
+        lines.append(f"weak_ref_OI_latest_interpretation: {_v(oi.get('latest_interpretation'))}")
+        voi = oi.get("volume_oi_cvd_state", {})
+        if voi:
+            lines.append(
+                f"weak_ref_OI_volume_oi_cvd_state: vol={_v(voi.get('volume_state'))}  "
+                f"oi={_v(voi.get('oi_state'))}  cvd={_v(voi.get('cvd_state'))}"
+            )
+
+        # L/S crowding labels
+        ls = ctx.get("long_short_ratio", {})
+        ga = ls.get("global_account", {})
+        tt = ls.get("top_trader_position", {})
+        lines.append(
+            f"weak_ref_LS_crowding: global={_v(ga.get('crowding'))}  "
+            f"top_trader={_v(tt.get('crowding'))}  "
+            f"overall={_v(ls.get('overall_crowding'))}"
+        )
+
+        # Spot/perp derived interpretation
+        sp = ctx.get("spot_perp", {})
+        if sp.get("available"):
+            lines.append(f"weak_ref_spot_perp_basis_signal: {_v(sp.get('basis_signal'))}")
+            lines.append(f"weak_ref_spot_perp_cvd_state: {_v(sp.get('cvd_state'))}")
+            lines.append(f"weak_ref_spot_perp_interpretation: {_v(sp.get('interpretation'))}")
+
+        # Funding spread signal label
+        spread = ctx.get("funding_spread", {})
+        if spread.get("signal"):
+            lines.append(f"weak_ref_funding_spread_signal: {_v(spread.get('signal'))}")
+
+        # Market structure labels
+        ms = ctx.get("market_structure", {})
+        if ms:
+            lines.append(f"weak_ref_market_structure: {ms}")
+
+        # Signal score (composite bias)
+        ss = ctx.get("signal_score", {})
+        if ss:
+            lines.append(
+                f"weak_ref_signal_score: composite={_v(ss.get('composite_score'))}  "
+                f"bias={_v(ss.get('bias'))}  strength={_v(ss.get('strength'))}"
+            )
+            for k, v in (ss.get("components") or {}).items():
+                score_val = v.get("score") if isinstance(v, dict) else v
+                lines.append(f"  weak_ref_signal.{k}: score={_v(score_val)}")
+
+        return lines
+
+    # ─── [SECTION 4] DEPLOYMENT_HINTS (do not use for direction) ────────────
+
+    @staticmethod
+    def _deployment_hints(ctx: Dict) -> List[str]:
+        """Pre-computed plan zones, entry sides, deployment context.
+        Prefixed optional_plan_hint_ — must NOT be used to decide direction."""
+        lines = ["=== optional_plan_hint: DEPLOYMENT_HINTS ==="]
+
+        deploy = ctx.get("deployment_context", {})
+        if deploy:
+            lines.append(
+                f"optional_plan_hint_primary_bias: {_v(deploy.get('primary_bias'))}"
+            )
+            lines.append(
+                f"optional_plan_hint_transition_state: {_v(deploy.get('transition_state'))}"
+            )
+            lines.append(
+                f"optional_plan_hint_deployment_score: {_v(deploy.get('deployment_score'))} "
+                f"({_v(deploy.get('deployment_score_value'))})"
+            )
+            lines.append(
+                f"optional_plan_hint_state_tags: {deploy.get('state_tags', [])}"
+            )
+            exec_ctx = deploy.get("execution_context", {})
+            if exec_ctx:
+                lines.append(f"optional_plan_hint_execution_context: {exec_ctx}")
+
+            pz = deploy.get("plan_zones", {})
+            if pz:
+                for zone_key, zone_val in pz.items():
+                    if isinstance(zone_val, dict):
+                        lines.append(
+                            f"  optional_plan_hint_zone.{zone_key}"
+                            f" (entry.side={_v(zone_val.get('side'))}): "
+                            f"{_f(zone_val.get('zone_low'), 1)}-{_f(zone_val.get('zone_high'), 1)}"
+                        )
+
+        # Position sizing directional SL/TP reference (hypothesis, not ground truth)
+        sizing = ctx.get("position_sizing", {})
+        if sizing and sizing.get("available"):
+            ref = sizing.get("reference_levels", {})
+            for side in ("long", "short"):
+                r = ref.get(side, {})
+                if r:
+                    lines.append(
+                        f"optional_plan_hint_sizing.{side}: "
+                        f"SL={_f(r.get('stop_loss'), 1)}  "
+                        f"TP1={_f(r.get('tp1'), 1)}  TP2={_f(r.get('tp2'), 1)}  "
+                        f"RR1={_f(r.get('risk_reward_tp1'))}  RR2={_f(r.get('risk_reward_tp2'))}"
+                    )
+
+        return lines

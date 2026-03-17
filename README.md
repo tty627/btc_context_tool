@@ -1,137 +1,162 @@
 # BTC Context Tool
 
-Market context report builder for the BTCUSDT perpetual contract using Binance REST APIs. Collects klines, orderbook data, trades, computes indicators/features, optionally renders charts, and can send the result directly to OpenAI for an AI-generated trading plan.
+基于 Binance REST API 的 BTCUSDT 永续合约市场数据面板工具。采集 K 线、盘口、成交流、衍生品等多维数据，计算技术指标与微观结构特征，可选生成图表，并支持直接调用 OpenAI 进行 AI 行情分析。
 
-## Features
+> **设计理念**：报告采用 `raw_first` 模式，只输出原始事实和数据质量信息，不在主报告中预设交易方向，最大化下游 LLM 的自主判读空间，消除锚定效应。
 
-* Multi-timeframe technical indicators: EMA, MACD, KDJ, RSI, **ATR**, **Bollinger Bands**, **VWAP**
-* Open-interest trend with price-OI state labelling
-* Global/top-trader long-short crowding ratios
-* Multi-snapshot orderbook dynamics (wall pull/add, spoofing risk)
-* Volume profile (POC/HVN/LVN), session profiles, anchored VWAP profiles
-* Basis (mark-index) and cross-exchange funding spread (Binance/Bybit/OKX)
-* Trade flow analysis: CVD, delta, large-trade clusters, absorption zones
-* Liquidation heatmap (from force orders or model estimate)
-* Optional private read-only account positions
-* **Concurrent API requests** — data collection runs in parallel via thread pool
-* **Direct OpenAI integration** — `--auto-analyze` sends the prompt to GPT and writes the analysis
-* **Watch mode** — `--watch N` re-runs every N seconds for continuous monitoring
-* **Historical output** — `--history` timestamps output filenames for post-trade review
-* **Structured logging** with Python `logging` module
+## 功能特性
 
-## Prerequisites
+- **多周期技术指标**：EMA、MACD、KDJ、RSI、ATR、布林带、VWAP
+- **成交流分析**：CVD、Delta、大单聚集区、吸收区、价格分层 Delta（Footprint 风格）
+- **盘口动态**：多快照盘口分析（挂单撤单速率、墙撤离/吸收/扫单事件）
+- **量价结构**：成交量分布（POC/HVN/LVN）、session 分时 VP、锚定 AVWAP
+- **衍生品数据**：OI 趋势（5m/15m/1h 分段）、全局/顶级交易者多空比、资金费率
+- **跨所数据**：Binance/Bybit/OKX 的 OI 及资金费率对比
+- **现货 vs 合约**：现货 CVD、basis bps、现货-合约价差
+- **K 线图表**：4h / 1h / 15m / 5m Delta 面板图 + 现货合约对比图
+- **并发采集**：所有 API 请求通过线程池并行执行
+- **AI 分析集成**：`--auto-analyze` 将报告发送至 GPT，输出行情分析
+- **持续监控**：`--watch N` 每 N 秒重新运行一次
+- **历史存档**：`--history` 自动为输出文件加时间戳
 
-* Python 3.8+ (3.11+ recommended)
-* Dependencies: `pip install -r requirements.txt`
+## 环境要求
 
-| Package | Purpose |
-|---------|---------|
-| `matplotlib>=3.0` | Chart generation (optional — script works without it) |
-| `openai>=1.0` | AI analysis via `--auto-analyze` (optional) |
-| `httpx>=0.27` | Faster HTTP with connection pooling (optional — falls back to urllib) |
+- Python 3.8+（推荐 3.11+）
+- 依赖安装：`pip install -r requirements.txt`
 
-## Usage
+| 依赖包 | 用途 |
+|--------|------|
+| `matplotlib>=3.0` | 图表生成（可选，缺失时跳过图表） |
+| `openai>=1.0` | AI 分析，`--auto-analyze` 时需要（可选） |
+| `httpx>=0.27` | 更快的 HTTP 连接池（可选，缺失时回退到 urllib） |
+
+## 快速开始
 
 ```bash
-# install dependencies
+# 安装依赖
 python3 -m pip install -r requirements.txt
 
-# basic run (writes to output/ directory)
+# 基础运行（输出到 output/ 目录）
 python3 main.py
 
-# one-click AI trading plan
+# 一键 AI 行情分析
 export OPENAI_API_KEY="sk-..."
 python3 main.py --auto-analyze
 
-# use a specific model
+# 指定模型
 python3 main.py --auto-analyze --ai-model gpt-4o-mini
 
-# continuous monitoring every 5 minutes
+# 持续监控（每 5 分钟）
 python3 main.py --watch 300
 
-# continuous monitoring with AI analysis
+# 持续监控 + AI 分析
 python3 main.py --watch 300 --auto-analyze
 
-# preserve historical outputs (timestamped filenames)
+# 保留历史输出（文件名带时间戳）
 python3 main.py --history
 
-# disable charts
+# 禁用图表
 python3 main.py --no-charts
 
-# tune market microstructure windows
+# raw_first 模式（默认，仅原始数据，无方向性先验）
+python3 main.py --report-mode raw_first
+
+# full_debug 模式（主报告 + 附录：信号评分、部署评估等派生字段）
+python3 main.py --report-mode full_debug
+
+# 调整微观结构采集参数
 python3 main.py --oi-period 5m --oi-limit 30 \
     --long-short-period 5m --long-short-limit 30 \
-    --orderbook-dynamic-samples 3 --orderbook-dynamic-interval 0.6 \
+    --orderbook-dynamic-samples 30 --orderbook-dynamic-interval 0.2 \
     --volume-profile-window 72 --volume-profile-bins 24
 
-# include Binance futures positions (read-only API)
+# 包含 Binance 合约持仓（只读 API）
 export BINANCE_API_KEY="your_read_only_key"
 export BINANCE_API_SECRET="your_read_only_secret"
 python3 main.py
 
-# or store credentials in project-local .env.local
+# 将凭证存入本地 .env.local（不入版本控制）
 cat > .env.local <<'EOF'
 export BINANCE_API_KEY="your_read_only_key"
 export BINANCE_API_SECRET="your_read_only_secret"
 export OPENAI_API_KEY="sk-..."
 EOF
 chmod 600 .env.local
-python3 main.py --auto-analyze
+source .env.local && python3 main.py --auto-analyze
 
-# custom output paths
+# 通过代理访问 Binance（避免 451 地域限制）
+export HTTPS_PROXY=http://127.0.0.1:10808
+python3 main.py
+# 若仍 451：多半是代理出口在受限地区（如美国）。在 v2rayN 中换为非美节点（如香港/新加坡/日本）再试。
+# 若代理是 SOCKS5：export HTTPS_PROXY=socks5://127.0.0.1:10808，并安装 pip install httpx-socks
+
+# 自定义输出路径
 python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 ```
 
-## Output Files
+## 输出文件
 
-| File | Description |
-|------|-------------|
-| `output/btc_context.json` | Raw JSON market context |
-| `output/btc_report.txt` | Structured prompt for AI trading assistant |
-| `output/btc_ai_analysis.md` | AI-generated trading plan (with `--auto-analyze`) |
-| `output/btc_summary.md` | Human-readable summary (with `--include-summary`) |
-| `output/charts/*.png` | Kline charts (if matplotlib installed) |
+| 文件 | 说明 |
+|------|------|
+| `output/btc_context.json` | 原始市场上下文 JSON（完整数据，含所有派生字段） |
+| `output/btc_prompt.txt` | 结构化市场数据面板（发送给 AI 的 prompt） |
+| `output/btc_ai_analysis.md` | AI 行情分析（使用 `--auto-analyze` 时生成） |
+| `output/btc_summary.md` | 人类可读摘要表（使用 `--include-summary` 时生成） |
+| `output/charts/*.png` | K 线图表（需安装 matplotlib） |
 
-With `--history` or `--watch`, output filenames include UTC timestamps, e.g. `btc_context_20260311_143000.json`.
+使用 `--history` 或 `--watch` 时，文件名会带 UTC 时间戳，例如 `btc_context_20260312_071309.json`。
 
-## Project Structure
+## 报告模式说明
+
+`btc_prompt.txt` 支持两种生成模式，通过 `config.py` 中的 `REPORT_MODE` 或 `--report-mode` 参数控制：
+
+| 模式 | 说明 |
+|------|------|
+| `raw_first`（默认） | 主报告只含原始事实：数据质量、指标数值、盘口、衍生品、持仓。不含任何方向性标签、信号评分或交易计划 |
+| `full_debug` | 在主报告后追加附录，包含派生字段：信号评分、部署偏向、state_tags、plan_zones、市场结构标签等 |
+
+> 主报告中被移除的锚定字段包括：`primary_bias`、`transition_state`、`composite_score`、`state_tags`、`plan_zones`、`market_structure bearish/bullish 标签`、`OI interpretation`、`L/S crowding`、`spot_perp interpretation` 等。这些字段仍保存在 `btc_context.json` 中，仅在 `raw_first` 模式下不进入主报告。
+
+## 项目结构
 
 ```
-├── main.py                   # Entry point and orchestration
-├── config.py                 # Central configuration
+├── main.py                   # 入口与整体调度
+├── config.py                 # 全局配置（含 REPORT_MODE）
 ├── collectors/
-│   └── binance_collector.py  # Binance/Bybit/OKX REST API client
+│   └── binance_collector.py  # Binance/Bybit/OKX REST API 客户端
 ├── indicators/
-│   └── engine.py             # EMA, MACD, KDJ, RSI, ATR, Bollinger, VWAP
-├── features/                 # Feature extraction (split into domain modules)
-│   ├── _base.py              # Shared utilities
-│   ├── technical.py          # Trend/momentum classification
-│   ├── orderbook.py          # Orderbook features and dynamics
-│   ├── volume.py             # Volume profile, session profiles
-│   ├── derivatives.py        # OI trend, long/short ratio, basis, funding
-│   ├── trade_flow.py         # CVD, delta, large trades, absorption
-│   ├── liquidation.py        # Liquidation heatmap
-│   ├── session.py            # Session context, funding countdown
-│   ├── deployment.py         # Deployment assessment scoring
-│   └── extractor.py          # Facade composing all mixins
+│   └── engine.py             # EMA、MACD、KDJ、RSI、ATR、布林带、VWAP
+├── features/                 # 特征提取（按领域拆分）
+│   ├── _base.py              # 公共工具
+│   ├── technical.py          # 趋势/动量分类
+│   ├── orderbook.py          # 盘口特征与动态
+│   ├── volume.py             # 量价结构、session 分析
+│   ├── derivatives.py        # OI、多空比、basis、资金费率
+│   ├── trade_flow.py         # CVD、Delta、大单、Footprint
+│   ├── spot_perp.py          # 现货 vs 合约对比
+│   ├── liquidation.py        # 清算热力图（模型估算）
+│   ├── session.py            # Session 上下文、费率倒计时
+│   ├── deployment.py         # 部署评估评分（附录用）
+│   └── extractor.py          # 聚合所有 mixin 的外观类
 ├── context/
-│   └── builder.py            # Assembles final context dict
+│   └── builder.py            # 组装最终 context dict
 ├── reports/
-│   ├── prompt_generator.py   # Builds Chinese prompt for AI
-│   └── summary_table.py      # Markdown summary table
+│   ├── prompt_generator.py   # raw_first 数据面板生成器
+│   └── summary_table.py      # Markdown 摘要表
 ├── advisor/
-│   └── ai_advisor.py         # OpenAI API integration
+│   └── ai_advisor.py         # OpenAI API 集成
 └── charts/
-    └── kline_chart.py        # Matplotlib chart generation
+    └── kline_chart.py        # matplotlib 图表生成
 ```
 
-## Private API Note
+## API 密钥说明
 
-When `BINANCE_API_KEY` and `BINANCE_API_SECRET` are present, account positions
-are collected automatically. Use `--include-account` to force on or `--no-account` to disable.
-Use a key with **read-only permissions** and never hardcode secrets in source files.
+- **公开市场数据**端点无需 API Key。
+- 当环境变量中存在 `BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 时，自动采集持仓数据。
+- 使用 `--include-account` 强制开启，`--no-account` 强制关闭。
+- 请使用**只读权限**的 API Key，不要在源码中硬编码密钥。
 
-## Environment Setup
+## 环境初始化
 
 ```bash
 python -m venv .venv
@@ -139,11 +164,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Or use the helper script: `source setup_env.sh`
+或使用辅助脚本：`source setup_env.sh`
 
-## Notes
+## 注意事项
 
-* Public market data endpoints do not require an API key.
-* All API calls run concurrently for faster data collection.
-* The prompt generator summarizes time-series data to reduce token usage.
-* ATR is used to provide quantitative stop-loss distance suggestions.
+- 所有 API 请求并发执行，采集速度快，通常在 5~10 秒内完成。
+- `btc_context.json` 保存完整原始数据，可供自定义后处理或调试。
+- `btc_prompt.txt` 默认为纯数据面板，适合直接作为 LLM prompt 使用。
+- 30m/1h K 线 Delta 需要 Binance 返回 `taker_buy_base` 字段；若不可用，报告中会标注 `kline_flow: unavailable`。

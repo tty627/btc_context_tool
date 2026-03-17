@@ -18,14 +18,12 @@ except ImportError:
 
 
 class AIAdvisor:
-    """Call OpenAI chat-completions and return a trading analysis.
+    """Call OpenAI-compatible chat-completions API for market analysis.
 
-    Uses urllib so we don't add a hard dependency on the ``openai`` package.
-    If the ``openai`` library *is* installed it will be preferred for its
-    richer error handling and streaming support.
+    Supports OpenAI, DeepSeek, and any OpenAI-compatible endpoint via base_url.
     """
 
-    API_URL = "https://api.openai.com/v1/chat/completions"
+    DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions"
 
     def __init__(
         self,
@@ -33,11 +31,13 @@ class AIAdvisor:
         model: str = OPENAI_MODEL,
         temperature: float = OPENAI_TEMPERATURE,
         max_tokens: int = OPENAI_MAX_TOKENS,
+        base_url: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.base_url = base_url
 
     def analyze(self, prompt: str) -> str:
         """Send *prompt* (the full user-prompt text) to the model and return
@@ -56,11 +56,19 @@ class AIAdvisor:
         except ImportError:
             return None
 
-        client = openai.OpenAI(api_key=self.api_key)
+        kwargs = {"api_key": self.api_key}
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        client = openai.OpenAI(**kwargs)
+        system_msg = (
+            PromptGenerator.ANALYSIS_SYSTEM_PROMPT
+            + "\n\n"
+            + PromptGenerator.OUTPUT_FORMAT_TEMPLATE
+        )
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": PromptGenerator.SYSTEM_PROMPT},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},
             ],
             temperature=self.temperature,
@@ -69,11 +77,16 @@ class AIAdvisor:
         return response.choices[0].message.content
 
     def _call_via_urllib(self, prompt: str) -> str:
+        system_msg = (
+            PromptGenerator.ANALYSIS_SYSTEM_PROMPT
+            + "\n\n"
+            + PromptGenerator.OUTPUT_FORMAT_TEMPLATE
+        )
         body = json.dumps(
             {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": PromptGenerator.SYSTEM_PROMPT},
+                    {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": self.temperature,
@@ -81,8 +94,9 @@ class AIAdvisor:
             }
         ).encode("utf-8")
 
+        api_url = (self.base_url.rstrip("/") + "/chat/completions") if self.base_url else self.DEFAULT_API_URL
         request = Request(
-            self.API_URL,
+            api_url,
             data=body,
             headers={
                 "Content-Type": "application/json",
