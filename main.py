@@ -988,7 +988,7 @@ def _run_once(args: argparse.Namespace) -> int:
 
             if args.smart:
                 try:
-                    detector.save_state(context)
+                    detector.save_state(context, analysis_text=analysis)
                 except Exception:
                     pass
 

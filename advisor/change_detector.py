@@ -39,9 +39,21 @@ class ChangeDetector:
 
         If no previous state exists, always returns True.
         """
+        acc = context.get("account_positions", {})
+        has_position = False
+        if acc.get("available"):
+            sym = acc.get("symbol_position")
+            if sym and abs(float(sym.get("position_amt", 0) or 0)) > 0:
+                has_position = True
+        if has_position:
+            return True, ["has_open_position"]
+
         prev = self._load_state()
         if prev is None:
             return True, ["first_run"]
+
+        if prev.get("had_actionable_signal"):
+            return True, ["previous_analysis_had_pending_order"]
 
         reasons: List[str] = []
 
@@ -84,7 +96,19 @@ class ChangeDetector:
             return True, reasons
         return False, []
 
-    def save_state(self, context: Dict) -> None:
+    def save_state(self, context: Dict, analysis_text: str = "") -> None:
+        had_signal = False
+        if analysis_text:
+            wait_markers = (
+                "execution_mode: wait", "execution_mode:wait",
+                "主结论: 等待", "主结论: 不交易", "主结论:等待", "主结论:不交易",
+            )
+            has_plan = ("pullback_plan:" in analysis_text
+                        or "trigger_plan:" in analysis_text
+                        or "immediate_entry_plan:" in analysis_text)
+            is_wait = any(m in analysis_text or m in analysis_text.lower() for m in wait_markers)
+            had_signal = has_plan and not is_wait
+
         state = {
             "timestamp": time.time(),
             "price": float(context.get("price", 0)),
@@ -92,6 +116,7 @@ class ChangeDetector:
             "session": context.get("session_context", {}).get("current_session", ""),
             "gates": self._extract_gates(context),
             "trend": self._extract_trend(context),
+            "had_actionable_signal": had_signal,
         }
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
