@@ -17,32 +17,43 @@ class PushPlusNotifier:
         self.token = token
 
     def send(self, title: str, content: str, template: str = "txt") -> bool:
+        import time as _time
         payload = {
             "token": self.token,
             "title": title,
             "content": content,
             "template": template,
         }
-        try:
-            result = subprocess.run(
-                ["curl", "-s", "-m", "20", self.API_URL,
-                 "-X", "POST",
-                 "-H", "Content-Type: application/json",
-                 "-d", json.dumps(payload, ensure_ascii=False)],
-                capture_output=True, text=True, timeout=25,
-            )
-            if result.returncode != 0:
-                logger.error("PushPlus curl failed: %s", result.stderr)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    ["curl", "-s", "-m", "20", self.API_URL,
+                     "-X", "POST",
+                     "-H", "Content-Type: application/json",
+                     "-d", json.dumps(payload, ensure_ascii=False)],
+                    capture_output=True, text=True, timeout=25,
+                )
+                if result.returncode != 0:
+                    logger.warning("PushPlus curl attempt %d/%d failed: %s",
+                                   attempt, max_attempts, result.stderr or "(no stderr)")
+                    if attempt < max_attempts:
+                        _time.sleep(3)
+                        continue
+                    return False
+                resp = json.loads(result.stdout)
+                if resp.get("code") == 200:
+                    logger.info("PushPlus sent OK: %s", title)
+                    return True
+                logger.warning("PushPlus returned code=%s: %s", resp.get("code"), resp.get("msg"))
                 return False
-            resp = json.loads(result.stdout)
-            if resp.get("code") == 200:
-                logger.info("PushPlus sent OK: %s", title)
-                return True
-            logger.warning("PushPlus returned code=%s: %s", resp.get("code"), resp.get("msg"))
-            return False
-        except Exception as exc:
-            logger.error("PushPlus send failed: %s", exc)
-            return False
+            except Exception as exc:
+                logger.warning("PushPlus attempt %d/%d error: %s", attempt, max_attempts, exc)
+                if attempt < max_attempts:
+                    _time.sleep(3)
+                    continue
+                return False
+        return False
 
     def send_trade_signal(self, analysis_text: str, context: dict) -> bool:
         """Parse AI analysis and send a concise trade notification."""

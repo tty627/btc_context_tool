@@ -611,11 +611,15 @@ def _send_pushplus(context: Dict, analysis_text: str) -> None:
         except ImportError:
             from advisor.pushplus_notifier import PushPlusNotifier
         notifier = PushPlusNotifier(token=token)
+        from advisor.pushplus_notifier import _is_wait_decision
+        if _is_wait_decision(analysis_text):
+            logger.info("PushPlus skipped: AI decision is wait/hold (no actionable setup)")
+            return
         sent = notifier.send_trade_signal(analysis_text, context)
         if sent:
             logger.info("PushPlus trade signal sent to WeChat")
         else:
-            logger.info("PushPlus skipped: AI decision is wait/hold (no actionable setup)")
+            logger.warning("PushPlus push FAILED — signal was actionable but delivery failed")
     except Exception as exc:
         logger.error("PushPlus notification error: %s", exc)
 
