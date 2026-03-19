@@ -6,11 +6,30 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger("btc_context")
+
+
+def _load_env_local() -> None:
+    """从项目根目录 .env.local 加载 export KEY=\"value\" 行到环境变量（文件已在 .gitignore）。"""
+    p = Path(__file__).resolve().parent / ".env.local"
+    if not p.is_file():
+        return
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key:
+            os.environ[key] = val
+
 
 try:
     from .collectors import BinanceFuturesCollector, ExternalDataCollector
@@ -65,17 +84,10 @@ def _load_chart_generator():
         raise
 
 
-def _make_timestamped_path(base_path: Path) -> Path:
-    """Insert a UTC timestamp before the file extension: foo.json -> foo_20260311_143000.json"""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return base_path.with_name(f"{base_path.stem}_{ts}{base_path.suffix}")
-
-
 def _resolve_output_files(
     context_file: Optional[str],
     report_file: Optional[str],
     chart_dir: Optional[str],
-    history: bool = False,
 ) -> Tuple[Path, Path, Path]:
     if context_file:
         context_path = Path(context_file).expanduser().resolve()
@@ -91,10 +103,6 @@ def _resolve_output_files(
         charts_path = Path(chart_dir).expanduser().resolve()
     else:
         charts_path = CHART_DIR
-
-    if history:
-        context_path = _make_timestamped_path(context_path)
-        report_path = _make_timestamped_path(report_path)
 
     return context_path, report_path, charts_path
 
@@ -381,13 +389,21 @@ def build_market_context(
         for lv in ref_levels
         if float(lv.get("price", 0)) > 0
     ]
-    vp = volume_profile
-    poc_price = vp.get("poc_price")
-    if poc_price and float(poc_price) > 0:
-        key_level_inputs.append({"name": "POC", "price": float(poc_price)})
     trade_flow["key_level_flows"] = feature_extractor.extract_key_level_flows(
         agg_trades, key_level_inputs,
     )
+
+    # Merge level test counts into each key_level_flow entry
+    level_tests = feature_extractor.extract_key_level_tests(
+        candles_15m=klines_by_timeframe.get("15m", []),
+        key_levels=key_level_inputs,
+    )
+    for entry in trade_flow["key_level_flows"]:
+        lookup_key = f"{entry.get('name')}@{entry.get('price')}"
+        test_info = level_tests.get(lookup_key, {})
+        entry["tests_12h"] = test_info.get("tests_12h")
+        entry["first_test_min_ago"] = test_info.get("first_test_min_ago")
+        entry["avg_bounce_pct"] = test_info.get("avg_bounce_pct")
 
     context = context_builder.build(
         symbol=symbol,
@@ -436,6 +452,13 @@ def build_market_context(
     context["signal_score"] = signal_score
     context["summary_files"] = {}
 
+    # ── Candle structure for key timeframes (4h / 1h) ────────────────────────
+    context["candle_structure"] = feature_extractor.extract_candle_structure(
+        candles_by_timeframe=klines_by_timeframe,
+        timeframes=("4h", "1h"),
+        n=3,
+    )
+
     primary_tf_for_price = timeframes[0]
     current_price_for_spot = indicators_by_timeframe[primary_tf_for_price]["price"]
     context["spot_perp"] = feature_extractor.extract_spot_perp_features(
@@ -448,6 +471,7 @@ def build_market_context(
         binance_oi=open_interest,
         okx_oi=okx_oi,
         bybit_oi=bybit_oi,
+        current_price=price,
     )
     context["transition"] = feature_extractor.extract_transition_features(
         open_interest_trend=open_interest_trend,
@@ -455,6 +479,7 @@ def build_market_context(
         funding=funding,
         trade_flow=trade_flow,
         spot_perp=context.get("spot_perp", {}),
+        candles_5m=klines_by_timeframe.get("5m", []),
     )
 
     if include_charts and chart_generator_cls is not None:
@@ -472,6 +497,9 @@ def build_market_context(
             chart_files["spot_perp"] = sp_result
         context["chart_files"] = chart_files
 
+    # Stash raw 1h klines for analysis_history outcome resolution (not written to AI prompt)
+    context["_klines_1h_raw"] = klines_by_timeframe.get("1h", [])
+
     return context
 
 
@@ -485,6 +513,7 @@ def _sanitize_context_for_ai_output(context: Dict) -> Dict:
     """
     sanitized = copy.deepcopy(context)
     sanitized["summary_files"] = {}
+    sanitized.pop("_klines_1h_raw", None)  # internal only, not for AI prompt
 
     for metrics in sanitized.get("timeframes", {}).values():
         if not isinstance(metrics, dict):
@@ -590,14 +619,43 @@ def _load_ai_advisor():
         return None
 
 
-def _run_ai_analysis(api_key: str, model: str, prompt_text: str, base_url: str | None = None) -> str:
+def _ordered_chart_items_for_ai(context: Dict) -> list[tuple[str, str]]:
+    """(标签, 路径) 顺序与多周期由大到小，便于模型读图。"""
+    order = ("4h", "1h", "15m", "5m", "spot_perp")
+    cf = context.get("chart_files") or {}
+    items: list[tuple[str, str]] = []
+    for k in order:
+        if k in cf and cf[k]:
+            label = "现货vs永续" if k == "spot_perp" else k
+            items.append((label, str(cf[k])))
+    return items
+
+
+def _run_ai_analysis(
+    api_key: str,
+    model: str,
+    prompt_text: str,
+    base_url: str | None = None,
+    chart_items: list[tuple[str, str]] | None = None,
+) -> str:
     AIAdvisor = _load_ai_advisor()
     if AIAdvisor is None:
         raise RuntimeError("advisor module could not be loaded")
     advisor = AIAdvisor(api_key=api_key, model=model, base_url=base_url)
-    token_est = advisor.estimate_tokens(prompt_text)
-    print(f"estimated prompt tokens: ~{token_est}")
-    return advisor.analyze(prompt_text)
+    n_img = 0
+    if chart_items:
+        from pathlib import Path as _P
+
+        for _, p in chart_items:
+            pp = _P(p)
+            if pp.is_file() and pp.suffix.lower() == ".png":
+                n_img += 1
+    token_est = advisor.estimate_tokens(prompt_text, num_images=n_img)
+    print(f"estimated prompt tokens (含图约估): ~{token_est}")
+    analysis = advisor.analyze(prompt_text, chart_items=chart_items or None)
+    if not analysis or not analysis.strip():
+        raise RuntimeError("AI analysis returned empty content; output file was not updated")
+    return analysis
 
 
 def _send_pushplus(context: Dict, analysis_text: str) -> None:
@@ -607,11 +665,26 @@ def _send_pushplus(context: Dict, analysis_text: str) -> None:
         return
     try:
         try:
-            from .advisor.pushplus_notifier import PushPlusNotifier
+            from .advisor.pushplus_notifier import PushPlusNotifier, _is_wait_decision, _full_content
         except ImportError:
-            from advisor.pushplus_notifier import PushPlusNotifier
+            from advisor.pushplus_notifier import PushPlusNotifier, _is_wait_decision, _full_content
+        try:
+            from .advisor.smart_ai_scheduler import analysis_has_open_position
+        except ImportError:
+            from advisor.smart_ai_scheduler import analysis_has_open_position
         notifier = PushPlusNotifier(token=token)
-        from advisor.pushplus_notifier import _is_wait_decision
+        price = context.get("price", 0)
+        symbol = context.get("symbol", "BTCUSDT")
+        # 持仓管理场景：有持仓就推送，无论是 hold/reduce/add
+        if analysis_has_open_position(analysis_text):
+            body = _full_content(analysis_text, max_len=4000)
+            sent = notifier.send(f"📋 {symbol} 持仓更新 @{price:.0f}", body, template="markdown")
+            if sent:
+                logger.info("PushPlus position update sent to WeChat")
+            else:
+                logger.warning("PushPlus push FAILED — position update delivery failed")
+            return
+        # 空仓场景：仅有新开单方案时推送
         if _is_wait_decision(analysis_text):
             logger.info("PushPlus skipped: AI decision is wait/hold (no actionable setup)")
             return
@@ -749,11 +822,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--no-charts", action="store_true", help="Disable kline screenshot generation")
     parser.add_argument(
-        "--history",
-        action="store_true",
-        help="Append UTC timestamp to output filenames to preserve historical runs",
-    )
-    parser.add_argument(
         "--include-account",
         action="store_true",
         help=(
@@ -776,9 +844,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ai-provider",
-        default="deepseek",
+        default="openai",
         choices=["openai", "deepseek"],
-        help="AI provider for --auto-analyze (default: deepseek)",
+        help="AI provider for --auto-analyze (default: openai / ChatGPT API)",
     )
     parser.add_argument(
         "--ai-model",
@@ -789,11 +857,34 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-ai-charts",
+        action="store_true",
+        help="--auto-analyze 时不把 K 线 PNG 传给模型（默认会传图，需 vision 模型如 gpt-4o-mini）",
+    )
+    parser.add_argument(
+        "--loop",
+        dest="loop_sec",
+        nargs="?",
+        const=300,
+        default=None,
+        type=int,
+        metavar="SEC",
+        help="循环简写：等同 --watch SEC；只写 --loop 默认 300 秒（会覆盖已写的 --watch）。",
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help=(
+            "一键循环监控：打开 --auto-analyze --smart --pushplus --cache-ttl 30，"
+            "默认每 600 秒（10 分钟）一轮；可用 --loop 300 改成 5 分钟等。"
+        ),
+    )
+    parser.add_argument(
         "--watch",
         type=int,
         default=0,
         metavar="SECONDS",
-        help="Re-run every N seconds (0 = single run). E.g. --watch 300 for 5-minute intervals.",
+        help="每 N 秒重新跑一轮（0=只跑一趟）。与 --loop 二选一即可，--loop 优先覆盖本项。",
     )
     parser.add_argument(
         "--html",
@@ -836,6 +927,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _apply_cli_shortcuts(args: argparse.Namespace) -> None:
+    """--loop 先定间隔；--monitor 再补全 AI/推送/缓存，并在未指定间隔时默认 600s（10 分钟）。"""
+    ls = getattr(args, "loop_sec", None)
+    if ls is not None:
+        args.watch = max(1, int(ls))
+    if getattr(args, "monitor", False):
+        args.auto_analyze = True
+        args.smart = True
+        args.pushplus = True
+        if not args.ai_model and args.ai_provider == "openai":
+            args.ai_model = OPENAI_MODEL
+        if args.cache_ttl <= 0:
+            args.cache_ttl = 30.0
+        if args.watch <= 0:
+            args.watch = 600
+
+
 def _run_once(args: argparse.Namespace) -> int:
     """Execute a single collect -> analyze cycle. Returns 0 on success."""
     timeframes = _parse_timeframes(args.timeframes)
@@ -862,12 +970,10 @@ def _run_once(args: argparse.Namespace) -> int:
     if args.include_account and args.no_account:
         raise ValueError("include-account and no-account cannot both be set")
 
-    use_history = args.history or args.watch > 0
     context_path, report_path, charts_path = _resolve_output_files(
         args.context_file,
         args.report_file,
         args.chart_dir,
-        history=use_history,
     )
 
     api_key = _sanitize_env_credential(os.getenv(BINANCE_API_KEY_ENV))
@@ -887,6 +993,19 @@ def _run_once(args: argparse.Namespace) -> int:
             "account position data will be unavailable",
             BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV,
         )
+
+    # ── Risk monitor: check trading discipline rules before market data fetch ──
+    pushplus_token = os.getenv(PUSHPLUS_TOKEN_ENV, "").strip()
+    if has_api_credentials and pushplus_token:
+        try:
+            try:
+                from .advisor.risk_monitor import RiskMonitor
+            except ImportError:
+                from advisor.risk_monitor import RiskMonitor
+            _risk_collector = BinanceFuturesCollector(api_key=api_key, api_secret=api_secret)
+            RiskMonitor().check_and_alert(_risk_collector, pushplus_token)
+        except Exception as _e:
+            logger.warning("risk monitor skipped: %s", _e)
 
     chart_generator_cls = None
     chart_warning = None
@@ -921,6 +1040,19 @@ def _run_once(args: argparse.Namespace) -> int:
         chart_generator_cls=chart_generator_cls,
         cache_ttl=args.cache_ttl,
     )
+    # ── Analysis history: update outcomes using already-fetched 1h klines ────
+    try:
+        try:
+            from .advisor.analysis_history import AnalysisHistory
+        except ImportError:
+            from advisor.analysis_history import AnalysisHistory
+        _history = AnalysisHistory()
+        _history.update_outcomes(context.get("_klines_1h_raw", []))
+        context["prior_decisions"] = _history.get_context_block()
+    except Exception as _e:
+        logger.warning("analysis_history update skipped: %s", _e)
+        context["prior_decisions"] = ""
+
     ai_context = write_outputs(context, context_path, report_path, report_mode=args.report_mode)
     if args.include_summary:
         summary_path = write_summary_output(context, context_path)
@@ -940,21 +1072,71 @@ def _run_once(args: argparse.Namespace) -> int:
     analysis = ""
     skip_ai = False
     if args.auto_analyze:
-        if args.smart:
+        try:
             try:
+                from .advisor.smart_ai_scheduler import (
+                    SKIPS_BEFORE_FORCE,
+                    analysis_has_actionable_signal,
+                    analysis_has_open_position,
+                    load_scheduler_state,
+                    save_scheduler_state,
+                )
+            except ImportError:
+                from advisor.smart_ai_scheduler import (
+                    SKIPS_BEFORE_FORCE,
+                    analysis_has_actionable_signal,
+                    analysis_has_open_position,
+                    load_scheduler_state,
+                    save_scheduler_state,
+                )
+        except ImportError:
+            load_scheduler_state = save_scheduler_state = None  # type: ignore
+            analysis_has_actionable_signal = lambda t: False  # type: ignore
+            analysis_has_open_position = lambda t: False  # type: ignore
+            SKIPS_BEFORE_FORCE = 3  # type: ignore
+
+        sched = load_scheduler_state() if load_scheduler_state else {}
+        fast_ai = bool(sched.get("fast_ai_mode"))
+        n_skip = int(sched.get("consecutive_skips", 0))
+        force_after_skips = bool(args.smart and n_skip >= SKIPS_BEFORE_FORCE)
+
+        if args.smart:
+            if fast_ai:
+                logger.info(
+                    "smart: 快速分析模式（约每 4 分钟）直至主结论 wait — 本轮必跑 AI",
+                )
+                skip_ai = False
+            elif force_after_skips:
+                logger.info(
+                    "smart: 已连续跳过 %d 次 AI（≥%d），本轮强制执行",
+                    n_skip,
+                    SKIPS_BEFORE_FORCE,
+                )
+                skip_ai = False
+            else:
                 try:
-                    from .advisor.change_detector import ChangeDetector
-                except ImportError:
-                    from advisor.change_detector import ChangeDetector
-                detector = ChangeDetector()
-                should, reasons = detector.should_analyze(context)
-                if should:
-                    logger.info("smart mode: AI triggered — %s", "; ".join(reasons))
-                else:
-                    logger.info("smart mode: no material change, skipping AI call")
-                    skip_ai = True
-            except Exception as exc:
-                logger.warning("smart mode detection failed, running AI anyway: %s", exc)
+                    try:
+                        from .advisor.change_detector import ChangeDetector
+                    except ImportError:
+                        from advisor.change_detector import ChangeDetector
+                    detector = ChangeDetector()
+                    should, reasons = detector.should_analyze(context)
+                    if should:
+                        logger.info("smart mode: AI triggered — %s", "; ".join(reasons))
+                    else:
+                        logger.info("smart mode: no material change, skipping AI call")
+                        skip_ai = True
+                except Exception as exc:
+                    logger.warning("smart mode detection failed, running AI anyway: %s", exc)
+
+        if args.smart and skip_ai and save_scheduler_state:
+            sched["consecutive_skips"] = n_skip + 1
+            save_scheduler_state(sched)
+            logger.info(
+                "smart scheduler: 连续跳过 %d/%d 次后下次将强制 AI",
+                sched["consecutive_skips"],
+                SKIPS_BEFORE_FORCE,
+            )
 
         if not skip_ai:
             provider = args.ai_provider
@@ -973,11 +1155,31 @@ def _run_once(args: argparse.Namespace) -> int:
                 logger.error("--auto-analyze requires %s to be set", key_env_name)
                 return 1
             model = args.ai_model or default_model
+            chart_items = None
+            if not args.no_ai_charts:
+                if provider == "deepseek":
+                    logger.info(
+                        "DeepSeek 仅支持纯文本，不传 K 线图（避免 400）。"
+                        "看图请改用: --ai-provider openai --ai-model gpt-4o-mini"
+                    )
+                else:
+                    chart_items = _ordered_chart_items_for_ai(context)
+                    if chart_items:
+                        logger.info(
+                            "auto-analyze 将附带 K 线图: %s",
+                            ", ".join(f"{a}→{Path(b).name}" for a, b in chart_items),
+                        )
+                    else:
+                        logger.info(
+                            "auto-analyze: 无可用图表（可装 matplotlib 或去掉 --no-charts）"
+                        )
             logger.info("sending prompt to %s/%s for analysis...", provider, model)
             prompt_text = PromptGenerator().build(
                 ai_context, report_mode=args.report_mode, include_instructions=False,
             )
-            analysis = _run_ai_analysis(ai_api_key, model, prompt_text, base_url=base_url)
+            analysis = _run_ai_analysis(
+                ai_api_key, model, prompt_text, base_url=base_url, chart_items=chart_items
+            )
             analysis_path = _resolve_analysis_path(context_path)
             analysis_path.parent.mkdir(parents=True, exist_ok=True)
             analysis_path.write_text(analysis, encoding="utf-8")
@@ -986,11 +1188,48 @@ def _run_once(args: argparse.Namespace) -> int:
             print(analysis)
             print("=" * 60)
 
+            # Record this analysis call for future bias calibration
+            try:
+                try:
+                    from .advisor.analysis_history import AnalysisHistory as _AH
+                except ImportError:
+                    from advisor.analysis_history import AnalysisHistory as _AH
+                _AH().record(analysis, float(context.get("price", 0)))
+            except Exception as _e:
+                logger.warning("analysis_history record skipped: %s", _e)
+
             if args.smart:
                 try:
-                    detector.save_state(context, analysis_text=analysis)
+                    try:
+                        from .advisor.change_detector import ChangeDetector as _CD
+                    except ImportError:
+                        from advisor.change_detector import ChangeDetector as _CD
+                    _CD().save_state(context, analysis_text=analysis)
                 except Exception:
                     pass
+            if save_scheduler_state and load_scheduler_state:
+                sched2 = load_scheduler_state()
+                sched2["consecutive_skips"] = 0
+                has_signal = analysis_has_actionable_signal(analysis)
+                has_position = analysis_has_open_position(analysis)
+                if has_signal:
+                    sched2["fast_ai_mode"] = True
+                    logger.info(
+                        "smart scheduler: 检测到可执行方案 → 接下来约每 4 分钟分析，直到 wait",
+                    )
+                elif has_position:
+                    sched2["fast_ai_mode"] = True
+                    logger.info(
+                        "smart scheduler: 检测到持仓中 → 继续每 4 分钟分析，直到持仓平仓",
+                    )
+                else:
+                    was_fast = sched2.get("fast_ai_mode")
+                    sched2["fast_ai_mode"] = False
+                    if was_fast and fast_ai:
+                        logger.info(
+                            "smart scheduler: 空仓且无挂单方案 → 退出快速分析，恢复常规定时",
+                        )
+                save_scheduler_state(sched2)
 
     if args.html:
         try:
@@ -1029,6 +1268,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("running under Python executable: %s", sys.executable)
     args = parse_args(argv if argv is not None else sys.argv[1:])
     _load_local_env_file(Path(__file__).resolve().parent / ".env.local")
+    _apply_cli_shortcuts(args)
+    if getattr(args, "monitor", False):
+        logger.info(
+            "monitor 模式: auto-analyze + smart + pushplus, cache_ttl=%s, watch=%ss",
+            args.cache_ttl,
+            args.watch,
+        )
 
     watch_interval = max(0, args.watch)
     iteration = 0
@@ -1048,13 +1294,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not watch_interval:
             return 0
 
-        logger.info("[watch] sleeping %ds until next run... (Ctrl+C to stop)", watch_interval)
         try:
-            time.sleep(watch_interval)
+            try:
+                from .advisor.smart_ai_scheduler import (
+                    FAST_POLL_SECONDS,
+                    load_scheduler_state as _load_sched,
+                )
+            except ImportError:
+                from advisor.smart_ai_scheduler import (
+                    FAST_POLL_SECONDS,
+                    load_scheduler_state as _load_sched,
+                )
+            st = _load_sched()
+            use_fast = bool(
+                args.auto_analyze and st.get("fast_ai_mode") and watch_interval > 0
+            )
+            sleep_sec = FAST_POLL_SECONDS if use_fast else watch_interval
+        except Exception:
+            sleep_sec = watch_interval
+        if sleep_sec != watch_interval:
+            logger.info(
+                "[watch] 快速分析中: %ds 后下一轮 (常规定时 %ds)… Ctrl+C 停止",
+                sleep_sec,
+                watch_interval,
+            )
+        else:
+            logger.info("[watch] sleeping %ds until next run... (Ctrl+C to stop)", sleep_sec)
+        try:
+            time.sleep(sleep_sec)
         except KeyboardInterrupt:
             logger.info("[watch] stopped by user")
             return 0
 
 
 if __name__ == "__main__":
+    _load_env_local()
     raise SystemExit(main())

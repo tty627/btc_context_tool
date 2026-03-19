@@ -15,7 +15,10 @@
 - **现货 vs 合约**：现货 CVD、basis bps、现货-合约价差
 - **K 线图表**：4h / 1h / 15m / 5m Delta 面板图 + 现货合约对比图
 - **并发采集**：所有 API 请求通过线程池并行执行
-- **AI 分析集成**：`--auto-analyze` 将报告发送至 GPT，输出行情分析
+- **AI 分析集成**：默认 **OpenAI + gpt-5**；多模态传 K 线 PNG。`--no-ai-charts` 只传文字。`OPENAI_REASONING_EFFORT` 可调推理档位；若主模型不可用会自动回退到 `gpt-5-mini -> gpt-4o -> gpt-4o-mini`
+- **AI 历史上下文**：每次 AI 分析后记录方向/入场/止损，下次运行时将近期预测与实际价格结果注入 prompt 末尾，帮助 AI 识别并纠正系统性方向偏差（`output/.analysis_history.json`）
+- **交易风控监控**：`--monitor` 模式每轮自动检查 4 条交易纪律规则，触发即微信推送提醒（需配置 `BINANCE_API_KEY` + `PUSHPLUS_TOKEN`）
+- **ETF 资金流**：BTC 现货 ETF 日净流量（SoSoValue 主源 / coinglass 备用）+ 恐慌贪婪指数
 - **持续监控**：`--watch N` 每 N 秒重新运行一次
 - **历史存档**：`--history` 自动为输出文件加时间戳
 
@@ -43,11 +46,21 @@ python3 main.py
 export OPENAI_API_KEY="sk-..."
 python3 main.py --auto-analyze
 
-# 指定模型
+# 默认 openai + gpt-5；手动指定模型示例：
 python3 main.py --auto-analyze --ai-model gpt-4o-mini
+
+# 只传文字、不传 K 线图
+python3 main.py --auto-analyze --no-ai-charts
 
 # 持续监控（每 5 分钟）
 python3 main.py --watch 300
+# 简写：只写 --loop 即每 300 秒一轮；--loop 600 即 10 分钟
+python3 main.py --loop
+python3 main.py --loop 600
+
+# 一键循环监控（AI + 智能省调用 + PushPlus + 缓存 30s，默认每 10 分钟）
+python3 main.py --monitor
+python3 main.py --monitor --loop 300   # 改回 5 分钟一轮
 
 # 持续监控 + AI 分析
 python3 main.py --watch 300 --auto-analyze
@@ -99,12 +112,24 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 | 文件 | 说明 |
 |------|------|
 | `output/btc_context.json` | 原始市场上下文 JSON（完整数据，含所有派生字段） |
-| `output/btc_prompt.txt` | 结构化市场数据面板（发送给 AI 的 prompt） |
+| `output/btc_prompt.txt` | 结构化市场数据面板 + 文末输出格式（发送给 AI 的 user prompt） |
+| `output/btc_system.txt` | 分析用系统提示（角色与决策原则，不含文末格式 duplicate 时可与 prompt 配合使用） |
 | `output/btc_ai_analysis.md` | AI 行情分析（使用 `--auto-analyze` 时生成） |
 | `output/btc_summary.md` | 人类可读摘要表（使用 `--include-summary` 时生成） |
 | `output/charts/*.png` | K 线图表（需安装 matplotlib） |
 
 使用 `--history` 或 `--watch` 时，文件名会带 UTC 时间戳，例如 `btc_context_20260312_071309.json`。
+
+**`--smart` 调度（与 `--monitor` 联动）**：连续 **3** 次因「无实质变化」跳过 AI 后，下一轮 **强制** 调用 AI；若本轮分析出现 **可执行挂单方案**（非 wait），则改为约 **每 4 分钟** 一轮 AI，直到结论回到 **wait/无方案**。状态文件：`output/.smart_ai_scheduler.json`。
+
+**默认覆盖**：不带 `--history` 时，同一路径下的 `btc_context.json`、`btc_prompt.txt`、`btc_ai_analysis.md`、`charts/*.png` 等每次运行会被**直接覆盖**为最新一轮快照。
+
+### 把 output 交给网页版 ChatGPT / Claude
+
+1. **系统侧**：粘贴 `output/btc_system.txt` 全文（或放进「自定义说明」）。程序调用 API 时还会在 system 里附加「输出格式」；网页版若回复结构不稳定，可把 `btc_prompt.txt` **最底部**「输出格式 / OUTPUT」那段再强调一次。
+2. **数据侧**：粘贴 `output/btc_prompt.txt` 全文（已含 SECTION 1/2 与文末格式模板）。
+3. **图表**：在对话里**上传** `output/charts/` 下 `BTCUSDT_4h.png`、`BTCUSDT_1h.png`、`BTCUSDT_15m.png`、`BTCUSDT_5m.png`，若有则再加 `BTCUSDT_spot_perp.png`，并说明「与上面文字为同一时刻快照」。
+4. **不必上传**：`btc_ai_analysis.md` 是**上次**自动分析结果，不是输入；`btc_context.json` 体积大，网页对话一般不需要，除非你要让模型查原始字段。
 
 ## 报告模式说明
 
@@ -144,15 +169,47 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 │   ├── prompt_generator.py   # raw_first 数据面板生成器
 │   └── summary_table.py      # Markdown 摘要表
 ├── advisor/
-│   └── ai_advisor.py         # OpenAI API 集成
+│   ├── ai_advisor.py         # OpenAI API 集成
+│   ├── analysis_history.py   # AI 预测历史追踪与偏差校准注入
+│   ├── risk_monitor.py       # 交易风控监控（日亏限额/复仇冷静/频率过高等）
+│   ├── smart_ai_scheduler.py # 智能 AI 调度（信号驱动快速轮询）
+│   ├── change_detector.py    # 市场变化检测（避免重复 AI 调用）
+│   └── pushplus_notifier.py  # PushPlus 微信推送
 └── charts/
     └── kline_chart.py        # matplotlib 图表生成
 ```
 
+## 交易风控监控
+
+`--monitor` 模式下，每轮行情采集前自动检查以下 4 条交易纪律规则，触发时通过 PushPlus 推送微信提醒：
+
+| 规则 | 触发条件 | 说明 |
+|------|----------|------|
+| 日亏损限额 | 今日净亏 > 40 USDT | 每超出 10 USDT 再推一次 |
+| 复仇冷静期 | 60 分钟内连续 2 笔亏损 | 提醒暂停 60 分钟 |
+| 大赢次日警告 | 昨日净盈 > 50 USDT | 每日首次运行时推一次 |
+| 频率过高 | 1 小时内成交 ≥ 5 次 | 每小时最多推一次 |
+
+需要设置 `BINANCE_API_KEY` + `BINANCE_API_SECRET`（只读权限）+ `PUSHPLUS_TOKEN`。状态文件：`output/.risk_monitor_state.json`。
+
+## AI 历史上下文
+
+每次 `--auto-analyze` 完成后，程序自动将本次分析的方向、止损、置信度存入 `output/.analysis_history.json`。下次运行时，利用**已拉取的 1h K 线**（无额外 API 调用）回填 1h/4h 实际价格结果，并将近 5 条记录注入 prompt 末尾：
+
+```
+=== PRIOR_DECISIONS_CONTEXT ===
+[校准参考 — 请在完成 PHASE A 独立判断后再查阅此段，勿将历史决策作为当次方向依据]
+03-19 14:00  BTC@84200  结论:开多  stop:83200  → 1h:83500(-700)[MISS]  4h:82800(-1400)[MISS]
+03-18 22:00  BTC@85100  结论:等待                → 1h:pending  4h:pending
+recent_direction_bias: long_heavy (2多/0空/2次)
+```
+
+AI 可据此识别系统性方向偏差，在连续误判后主动调整分析角度。
+
 ## API 密钥说明
 
 - **公开市场数据**端点无需 API Key。
-- 当环境变量中存在 `BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 时，自动采集持仓数据。
+- 当环境变量中存在 `BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 时，自动采集持仓数据及风控监控。
 - 使用 `--include-account` 强制开启，`--no-account` 强制关闭。
 - 请使用**只读权限**的 API Key，不要在源码中硬编码密钥。
 

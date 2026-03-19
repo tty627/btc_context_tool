@@ -162,11 +162,36 @@ class ExternalDataCollector:
     def get_btc_etf_flow(self) -> Dict:
         """Try to fetch BTC spot ETF daily net flow.
 
-        Uses coinglass public endpoint; may require API key for full data.
-        Returns ``available: False`` if the endpoint is gated or fails.
+        Attempts SoSoValue first (free, no API key required), then falls back
+        to the coinglass public endpoint. Returns ``available: False`` if both fail.
         """
-        url = "https://api.coinglass.com/api/etf/bitcoin/flow-total"
+        # Primary: SoSoValue
         try:
+            url = "https://api.sosovalue.xyz/api/etf/us-btc-fund/flow"
+            data = self._get_json(url)
+            if isinstance(data, dict) and str(data.get("code", "")) in ("0", "200", ""):
+                rows = data.get("data", [])
+                if rows and isinstance(rows, list):
+                    latest = rows[-1]
+                    net_flow = (
+                        float(latest.get("totalNetFlow", 0) or 0)
+                        or float(latest.get("netFlow", 0) or 0)
+                        or float(latest.get("net_flow", 0) or 0)
+                    )
+                    date_val = latest.get("date", "") or latest.get("time", "")
+                    if net_flow != 0 or date_val:
+                        return {
+                            "available": True,
+                            "date": str(date_val),
+                            "total_net_flow_usd": net_flow,
+                            "source": "sosovalue",
+                        }
+        except Exception as exc:
+            logger.debug("etf_flow sosovalue fetch failed: %s", exc)
+
+        # Fallback: coinglass
+        try:
+            url = "https://api.coinglass.com/api/etf/bitcoin/flow-total"
             data = self._get_json(url)
             if isinstance(data, dict) and data.get("code") == "0":
                 rows = data.get("data", [])
@@ -178,10 +203,10 @@ class ExternalDataCollector:
                         "total_net_flow_usd": float(latest.get("totalNetFlow", 0)),
                         "source": "coinglass_free",
                     }
-            return {"available": False, "reason": "gated_or_empty"}
         except Exception as exc:
-            logger.debug("etf_flow fetch failed: %s", exc)
-            return {"available": False, "reason": str(exc)}
+            logger.debug("etf_flow coinglass fetch failed: %s", exc)
+
+        return {"available": False, "reason": "all_sources_failed"}
 
     # ── aggregate convenience method ─────────────────────────────────────
 
