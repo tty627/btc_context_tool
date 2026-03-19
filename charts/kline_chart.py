@@ -541,7 +541,7 @@ class KlineChartGenerator:
         if timeframe == "1h":
             return {
                 "mode": "decision", "title": "1H Decision",
-                "panels": ["price", "derivatives", "volume"],
+                "panels": ["price", "delta", "volume"],
                 "oi_period": "15m", "show_micro": False,
                 "label_limit": 6, "show_trade_clusters": False,
                 "show_ema7": False, "show_events": False,

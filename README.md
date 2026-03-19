@@ -2,7 +2,7 @@
 
 基于 Binance REST API 的 BTCUSDT 永续合约市场数据面板工具。采集 K 线、盘口、成交流、衍生品等多维数据，计算技术指标与微观结构特征，可选生成图表，并支持直接调用 OpenAI 进行 AI 行情分析。
 
-> **设计理念**：报告采用 `raw_first` 模式，只输出原始事实和数据质量信息，不在主报告中预设交易方向，最大化下游 LLM 的自主判读空间，消除锚定效应。
+> **设计理念**：默认采用 `raw_first` + **双阶段 AI**。第一阶段 `research` 读取原始事实、图表和高价值原始附录，生成交易员 handoff；第二阶段 `decision` 基于 handoff + 关键原始证据给出最终开仓/持仓处理。目标是**高赔率优先、允许低胜率、错了快砍**，而不是追求分析报告的形式完整。
 
 ## 功能特性
 
@@ -15,7 +15,9 @@
 - **现货 vs 合约**：现货 CVD、basis bps、现货-合约价差
 - **K 线图表**：4h / 1h / 15m / 5m Delta 面板图 + 现货合约对比图
 - **并发采集**：所有 API 请求通过线程池并行执行
-- **AI 分析集成**：默认 **OpenAI + gpt-5**；多模态传 K 线 PNG。`--no-ai-charts` 只传文字。`OPENAI_REASONING_EFFORT` 可调推理档位；若主模型不可用会自动回退到 `gpt-5-mini -> gpt-4o -> gpt-4o-mini`
+- **双阶段 AI 决策**：`research -> decision` 两段式调用；`research` 生成结构化 handoff，`decision` 结合 handoff、关键原始附录和关键图表做最终拍板
+- **高赔率决策目标**：优先找“位置干净 + 失效清晰 + 盈亏比不对称”的机会；脏中位 / RR 一般直接 `WAIT`；允许小亏损，不鼓励扛单或希望式持仓
+- **AI 分析集成**：默认 **OpenAI + gpt-5**；多模态传 K 线 PNG。`OPENAI_REASONING_EFFORT` 可调推理档位；`research` 默认带全量关键图，`decision` 默认带关键高周期图。若主模型不可用会自动回退到 `gpt-5-mini -> gpt-4o -> gpt-4o-mini`
 - **AI 历史上下文**：每次 AI 分析后记录方向/入场/止损，下次运行时将近期预测与实际价格结果注入 prompt 末尾，帮助 AI 识别并纠正系统性方向偏差（`output/.analysis_history.json`）
 - **交易风控监控**：`--monitor` 模式每轮自动检查 4 条交易纪律规则，触发即微信推送提醒（需配置 `BINANCE_API_KEY` + `PUSHPLUS_TOKEN`）
 - **ETF 资金流**：BTC 现货 ETF 日净流量（SoSoValue 主源 / coinglass 备用）+ 恐慌贪婪指数
@@ -42,11 +44,11 @@ python3 -m pip install -r requirements.txt
 # 基础运行（输出到 output/ 目录）
 python3 main.py
 
-# 一键 AI 行情分析
+# 一键 AI 行情分析（双阶段：research -> decision）
 export OPENAI_API_KEY="sk-..."
 python3 main.py --auto-analyze
 
-# 默认 openai + gpt-5；手动指定模型示例：
+# 默认 openai + gpt-5；更快但通常更弱的示例：
 python3 main.py --auto-analyze --ai-model gpt-4o-mini
 
 # 只传文字、不传 K 线图
@@ -111,10 +113,17 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 
 | 文件 | 说明 |
 |------|------|
-| `output/btc_context.json` | 原始市场上下文 JSON（完整数据，含所有派生字段） |
-| `output/btc_prompt.txt` | 结构化市场数据面板 + 文末输出格式（发送给 AI 的 user prompt） |
-| `output/btc_system.txt` | 分析用系统提示（角色与决策原则，不含文末格式 duplicate 时可与 prompt 配合使用） |
-| `output/btc_ai_analysis.md` | AI 行情分析（使用 `--auto-analyze` 时生成） |
+| `output/btc_context.json` | 市场上下文 JSON（含派生字段与 `raw_appendix`） |
+| `output/btc_prompt.txt` | 兼容/手工使用的单文件数据面板 |
+| `output/btc_system.txt` | 兼容/手工使用的系统提示；在自动分析中会被覆盖为当前 decision system |
+| `output/btc_research_system.txt` | `research` 阶段 system prompt |
+| `output/btc_research_prompt.txt` | `research` 阶段 user prompt（含 `RAW_APPENDIX`） |
+| `output/btc_ai_research.md` | `research` 阶段原始输出 |
+| `output/btc_research_handoff.json` | `research` 阶段交给 `decision` 的结构化 handoff |
+| `output/btc_decision_system.txt` | `decision` 阶段 system prompt |
+| `output/btc_decision_prompt.txt` | `decision` 阶段 user prompt |
+| `output/btc_ai_decision.md` | `decision` 阶段原始输出 |
+| `output/btc_ai_analysis.md` | 最终 AI 结果的兼容文件（与 `btc_ai_decision.md` 同步） |
 | `output/btc_summary.md` | 人类可读摘要表（使用 `--include-summary` 时生成） |
 | `output/charts/*.png` | K 线图表（需安装 matplotlib） |
 
@@ -122,14 +131,40 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 
 **`--smart` 调度（与 `--monitor` 联动）**：连续 **3** 次因「无实质变化」跳过 AI 后，下一轮 **强制** 调用 AI；若本轮分析出现 **可执行挂单方案**（非 wait），则改为约 **每 4 分钟** 一轮 AI，直到结论回到 **wait/无方案**。状态文件：`output/.smart_ai_scheduler.json`。
 
-**默认覆盖**：不带 `--history` 时，同一路径下的 `btc_context.json`、`btc_prompt.txt`、`btc_ai_analysis.md`、`charts/*.png` 等每次运行会被**直接覆盖**为最新一轮快照。
+**默认覆盖**：不带 `--history` 时，同一路径下的 `btc_context.json`、`btc_prompt.txt`、`btc_research_*`、`btc_decision_*`、`btc_ai_analysis.md`、`charts/*.png` 等每次运行会被**直接覆盖**为最新一轮快照。
+
+## AI 决策流程
+
+```mermaid
+flowchart TD
+  marketData[MarketContext] --> rawAppendix[RawAppendix]
+  marketData --> basePanel[RawFirstPanel]
+  rawAppendix --> researchPrompt[ResearchPrompt]
+  basePanel --> researchPrompt
+  charts[KeyCharts] --> researchPrompt
+  researchPrompt --> researchModel[ResearchStage]
+  researchModel --> handoff[ResearchHandoffJson]
+  basePanel --> decisionPrompt[DecisionPrompt]
+  rawAppendix --> decisionPrompt
+  handoff --> decisionPrompt
+  charts --> decisionPrompt
+  decisionPrompt --> decisionModel[DecisionStage]
+  decisionModel --> finalDecision[FinalDecision]
+```
+
+- `research`：更像微观结构研究员，只负责提炼“现在最值得做的一条路、哪里失效、哪里别碰”
+- `decision`：更像交易员，只负责开仓/持仓处理，不追求格式完整，而追求**执行质量**
+- `decision` 输出目标是“交易备忘录”，不是分析报告
+- `decision` 的机器可读字段保留最小集合：`primary_decision`、`execution_mode`、`trade_plan / wait_plan`、`position_action`、`hard_invalidation / stop_loss`、`summary`
 
 ### 把 output 交给网页版 ChatGPT / Claude
 
-1. **系统侧**：粘贴 `output/btc_system.txt` 全文（或放进「自定义说明」）。程序调用 API 时还会在 system 里附加「输出格式」；网页版若回复结构不稳定，可把 `btc_prompt.txt` **最底部**「输出格式 / OUTPUT」那段再强调一次。
-2. **数据侧**：粘贴 `output/btc_prompt.txt` 全文（已含 SECTION 1/2 与文末格式模板）。
-3. **图表**：在对话里**上传** `output/charts/` 下 `BTCUSDT_4h.png`、`BTCUSDT_1h.png`、`BTCUSDT_15m.png`、`BTCUSDT_5m.png`，若有则再加 `BTCUSDT_spot_perp.png`，并说明「与上面文字为同一时刻快照」。
-4. **不必上传**：`btc_ai_analysis.md` 是**上次**自动分析结果，不是输入；`btc_context.json` 体积大，网页对话一般不需要，除非你要让模型查原始字段。
+1. **若你要模拟自动分析的最终决策阶段**：优先使用 `output/btc_decision_system.txt` + `output/btc_decision_prompt.txt`。
+2. **若你要手动复现完整双阶段**：
+   先用 `output/btc_research_system.txt` + `output/btc_research_prompt.txt` 生成研究结果；
+   再把研究结果整理成 `btc_research_handoff.json` 风格，配合 `btc_decision_system.txt` + `btc_decision_prompt.txt` 做最终决策。
+3. **图表**：上传 `output/charts/` 下 `BTCUSDT_4h.png`、`BTCUSDT_1h.png`、`BTCUSDT_15m.png`，若有则再加 `BTCUSDT_spot_perp.png`。`research` 阶段可加 `5m`；`decision` 阶段通常只需要关键图。
+4. **不必上传**：`btc_ai_analysis.md` / `btc_ai_decision.md` 是**上次**自动分析结果，不是输入；`btc_context.json` 体积较大，一般只在你想让模型查原始字段时才需要。
 
 ## 报告模式说明
 
@@ -166,10 +201,11 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 ├── context/
 │   └── builder.py            # 组装最终 context dict
 ├── reports/
-│   ├── prompt_generator.py   # raw_first 数据面板生成器
+│   ├── prompt_generator.py   # research/decision 双阶段提示词生成器
 │   └── summary_table.py      # Markdown 摘要表
 ├── advisor/
 │   ├── ai_advisor.py         # OpenAI API 集成
+│   ├── analysis_parser.py    # 最终输出解析（信号/持仓/等待识别）
 │   ├── analysis_history.py   # AI 预测历史追踪与偏差校准注入
 │   ├── risk_monitor.py       # 交易风控监控（日亏限额/复仇冷静/频率过高等）
 │   ├── smart_ai_scheduler.py # 智能 AI 调度（信号驱动快速轮询）
@@ -194,7 +230,7 @@ python3 main.py --context-file ~/mycontext.json --report-file ~/report.txt
 
 ## AI 历史上下文
 
-每次 `--auto-analyze` 完成后，程序自动将本次分析的方向、止损、置信度存入 `output/.analysis_history.json`。下次运行时，利用**已拉取的 1h K 线**（无额外 API 调用）回填 1h/4h 实际价格结果，并将近 5 条记录注入 prompt 末尾：
+每次 `--auto-analyze` 完成后，程序自动将**最终 decision 阶段**的方向、止损、置信度存入 `output/.analysis_history.json`。下次运行时，利用**已拉取的 1h K 线**（无额外 API 调用）回填 1h/4h 实际价格结果，并将近 5 条记录注入 `decision` prompt 末尾：
 
 ```
 === PRIOR_DECISIONS_CONTEXT ===
@@ -226,6 +262,7 @@ pip install -r requirements.txt
 ## 注意事项
 
 - 所有 API 请求并发执行，采集速度快，通常在 5~10 秒内完成。
-- `btc_context.json` 保存完整原始数据，可供自定义后处理或调试。
-- `btc_prompt.txt` 默认为纯数据面板，适合直接作为 LLM prompt 使用。
+- `btc_context.json` 保存完整上下文与 `raw_appendix`，可供自定义后处理或调试。
+- `btc_prompt.txt` / `btc_system.txt` 主要用于兼容旧流程或手工粘贴；自动分析时优先参考 `btc_research_*` 与 `btc_decision_*`。
+- 双阶段 `gpt-5` 方案更偏“质量优先”而非“速度优先”；若你更看重速度，可手动降模型或降低 `OPENAI_REASONING_EFFORT`。
 - 30m/1h K 线 Delta 需要 Binance 返回 `taker_buy_base` 字段；若不可用，报告中会标注 `kline_flow: unavailable`。

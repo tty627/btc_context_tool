@@ -1,13 +1,15 @@
 import argparse
 import concurrent.futures
 import copy
+from datetime import datetime, timezone
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger("btc_context")
 
@@ -41,6 +43,8 @@ try:
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
         REPORT_MODE, SUMMARY_FILE, SYMBOL, SYSTEM_PROMPT_FILE,
+        AI_DECISION_FILE, AI_RESEARCH_FILE, DECISION_PROMPT_FILE, DECISION_SYSTEM_FILE,
+        RESEARCH_HANDOFF_FILE, RESEARCH_PROMPT_FILE, RESEARCH_SYSTEM_FILE,
         PUSHPLUS_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
@@ -58,6 +62,8 @@ except ImportError:
         LONG_SHORT_LIMIT, LONG_SHORT_PERIOD, OI_LIMIT, OI_PERIOD, OPENAI_API_KEY_ENV,
         OPENAI_MODEL, ORDERBOOK_DYNAMIC_INTERVAL, ORDERBOOK_DYNAMIC_SAMPLES, REPORT_FILE,
         REPORT_MODE, SUMMARY_FILE, SYMBOL, SYSTEM_PROMPT_FILE,
+        AI_DECISION_FILE, AI_RESEARCH_FILE, DECISION_PROMPT_FILE, DECISION_SYSTEM_FILE,
+        RESEARCH_HANDOFF_FILE, RESEARCH_PROMPT_FILE, RESEARCH_SYSTEM_FILE,
         PUSHPLUS_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
         TIMEFRAMES, VOLUME_PROFILE_BINS, VOLUME_PROFILE_WINDOW,
     )
@@ -162,6 +168,196 @@ def _looks_like_placeholder_credential(raw: Optional[str]) -> bool:
         "changeme",
     }
     return lowered in placeholder_values or lowered.startswith("your_")
+
+
+def _iso_utc_from_ms(ts_ms: int) -> str:
+    if not ts_ms:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _compact_kline_rows(rows: Sequence[Dict], limit: int) -> list[Dict[str, Any]]:
+    compact: list[Dict[str, Any]] = []
+    for row in list(rows)[-limit:]:
+        volume = float(row.get("volume", 0) or 0)
+        quote_volume = float(row.get("quote_volume", 0) or 0)
+        taker_buy_base = float(row.get("taker_buy_base", 0) or 0)
+        taker_buy_quote = float(row.get("taker_buy_quote", 0) or 0)
+        compact.append(
+            {
+                "open_time": _iso_utc_from_ms(int(row.get("open_time", 0))),
+                "close_time": _iso_utc_from_ms(int(row.get("close_time", 0))),
+                "open": round(float(row.get("open", 0) or 0), 2),
+                "high": round(float(row.get("high", 0) or 0), 2),
+                "low": round(float(row.get("low", 0) or 0), 2),
+                "close": round(float(row.get("close", 0) or 0), 2),
+                "volume": round(volume, 3),
+                "quote_volume": round(quote_volume, 2),
+                "taker_buy_base": round(taker_buy_base, 3),
+                "taker_sell_base": round(max(0.0, volume - taker_buy_base), 3),
+                "taker_buy_quote": round(taker_buy_quote, 2),
+                "taker_sell_quote": round(max(0.0, quote_volume - taker_buy_quote), 2),
+            }
+        )
+    return compact
+
+
+def _compress_price_level_bins(all_bins: Sequence[Dict], current_price: float, limit: int = 18) -> list[Dict[str, Any]]:
+    if not all_bins:
+        return []
+    selected: Dict[float, Dict[str, Any]] = {}
+    ranked = sorted(
+        list(all_bins),
+        key=lambda row: float(row.get("total_quote", 0) or 0),
+        reverse=True,
+    )
+    for row in ranked[: max(6, limit // 2)]:
+        price = float(row.get("price", 0) or 0)
+        selected[price] = row
+    if current_price > 0:
+        near_rows = [
+            row
+            for row in all_bins
+            if abs(float(row.get("price", 0) or 0) - current_price) / max(current_price, 1.0) <= 0.012
+        ]
+        for row in near_rows[:limit]:
+            price = float(row.get("price", 0) or 0)
+            selected[price] = row
+    rows = sorted(selected.values(), key=lambda row: float(row.get("price", 0) or 0))
+    output: list[Dict[str, Any]] = []
+    for row in rows[:limit]:
+        output.append(
+            {
+                "price": round(float(row.get("price", 0) or 0), 2),
+                "buy_quote": round(float(row.get("buy_quote", 0) or 0), 2),
+                "sell_quote": round(float(row.get("sell_quote", 0) or 0), 2),
+                "delta_quote": round(float(row.get("delta_quote", 0) or 0), 2),
+                "imbalance": round(float(row.get("imbalance", 0) or 0), 3),
+                "signal": row.get("signal", "balanced"),
+                "total_quote": round(float(row.get("total_quote", 0) or 0), 2),
+            }
+        )
+    return output
+
+
+def _build_raw_appendix(context: Dict, klines_by_timeframe: Dict[str, list]) -> Dict[str, Any]:
+    price = float(context.get("price", 0) or 0)
+    append: Dict[str, Any] = {}
+
+    kline_appendix: Dict[str, Any] = {}
+    for tf, limit in (("4h", 12), ("1h", 24), ("15m", 32), ("5m", 48)):
+        rows = _compact_kline_rows(klines_by_timeframe.get(tf, []), limit)
+        if not rows:
+            continue
+        kline_appendix[tf] = {
+            "bar_state": context.get("timeframes", {}).get(tf, {}).get("bar_state", {}),
+            "bars": rows,
+        }
+    if kline_appendix:
+        append["klines"] = kline_appendix
+
+    oi_appendix: Dict[str, Any] = {}
+    for period in ("5m", "15m", "1h"):
+        series = context.get("open_interest_trend", {}).get("periods", {}).get(period, {}).get("series", [])
+        if not series:
+            continue
+        oi_appendix[period] = [
+            {
+                "timestamp": _iso_utc_from_ms(int(row.get("timestamp", 0))),
+                "price": round(float(row.get("price", 0) or 0), 2),
+                "open_interest": round(float(row.get("open_interest", 0) or 0), 4),
+                "price_delta_pct": round(float(row.get("price_delta_pct", 0) or 0), 4),
+                "oi_delta_pct": round(float(row.get("oi_delta_pct", 0) or 0), 4),
+                "state": row.get("state", "unknown"),
+                "interpretation": row.get("interpretation", "unknown"),
+            }
+            for row in list(series)[-12:]
+        ]
+    if oi_appendix:
+        append["open_interest_series"] = oi_appendix
+
+    ls_appendix: Dict[str, Any] = {}
+    for key in ("global_account", "top_trader_position"):
+        history = context.get("long_short_ratio", {}).get(key, {}).get("history", [])
+        if history:
+            ls_appendix[key] = list(history)[-12:]
+    if ls_appendix:
+        append["long_short_history"] = ls_appendix
+
+    trade_flow = context.get("trade_flow", {})
+    pld = trade_flow.get("price_level_delta", {})
+    trade_appendix: Dict[str, Any] = {}
+    cvd_path = trade_flow.get("cvd_path", [])
+    if cvd_path:
+        trade_appendix["cvd_path_tail"] = [
+            {
+                "timestamp": _iso_utc_from_ms(int(row.get("timestamp", 0))),
+                "price": round(float(row.get("price", 0) or 0), 2),
+                "cvd_qty": round(float(row.get("cvd_qty", 0) or 0), 4),
+                "delta_quote": round(float(row.get("delta_quote", 0) or 0), 2),
+            }
+            for row in list(cvd_path)[-20:]
+        ]
+    if isinstance(pld, dict) and pld.get("available"):
+        trade_appendix["price_level_delta"] = {
+            "window_minutes": pld.get("window_minutes"),
+            "actual_coverage_minutes": pld.get("actual_coverage_minutes"),
+            "bin_size": pld.get("bin_size"),
+            "stacked_imbalance": pld.get("stacked_imbalance", []),
+            "absorption_zones": pld.get("absorption_zones", []),
+            "focus_bins": _compress_price_level_bins(pld.get("all_bins", []), current_price=price),
+        }
+    if trade_flow.get("absorption_zones"):
+        trade_appendix["trade_absorption_zones"] = trade_flow.get("absorption_zones", [])[:6]
+    if trade_flow.get("large_trade_clusters"):
+        trade_appendix["large_trade_clusters"] = trade_flow.get("large_trade_clusters", [])[:6]
+    if trade_appendix:
+        append["trade_flow_raw"] = trade_appendix
+
+    orderbook = context.get("orderbook_dynamics", {})
+    if orderbook:
+        append["orderbook_dynamics_raw"] = {
+            "summary": {
+                "sample_duration_seconds": orderbook.get("sample_duration_seconds"),
+                "snapshot_count": orderbook.get("snapshot_count"),
+                "spoofing_risk": orderbook.get("spoofing_risk"),
+                "wall_behavior": orderbook.get("wall_behavior"),
+                "cancel_to_add_ratio": orderbook.get("cancel_to_add_ratio"),
+                "pull_vs_fill_ratio": orderbook.get("pull_vs_fill_ratio"),
+                "wall_absorption_events": orderbook.get("wall_absorption_events"),
+                "wall_sweep_events": orderbook.get("wall_sweep_events"),
+                "wall_pull_without_trade_events": orderbook.get("wall_pull_without_trade_events"),
+            },
+            "top_bid_level_activity": orderbook.get("top_bid_level_activity", [])[:6],
+            "top_ask_level_activity": orderbook.get("top_ask_level_activity", [])[:6],
+            "persistent_walls": orderbook.get("persistent_walls", [])[:8],
+            "series_tail": orderbook.get("series", [])[-12:],
+        }
+
+    liquidation_heatmap = context.get("liquidation_heatmap", {})
+    if liquidation_heatmap:
+        append["liquidation_heatmap_raw"] = {
+            "source": liquidation_heatmap.get("source"),
+            "confidence": liquidation_heatmap.get("confidence"),
+            "zones": liquidation_heatmap.get("zones", [])[:8],
+        }
+
+    spot_perp = context.get("spot_perp", {})
+    if spot_perp.get("available"):
+        append["spot_perp_raw"] = {
+            "spot_delta_quote": spot_perp.get("spot_delta_quote"),
+            "spot_buy_quote_total": spot_perp.get("spot_buy_quote_total"),
+            "spot_sell_quote_total": spot_perp.get("spot_sell_quote_total"),
+            "spot_5m": spot_perp.get("spot_5m", {}),
+            "spot_15m": spot_perp.get("spot_15m", {}),
+            "basis_bps": spot_perp.get("basis_bps"),
+            "spot_cvd_qty": spot_perp.get("spot_cvd_qty"),
+        }
+
+    return append
 
 def build_market_context(
     symbol: str,
@@ -481,6 +677,7 @@ def build_market_context(
         spot_perp=context.get("spot_perp", {}),
         candles_5m=klines_by_timeframe.get("5m", []),
     )
+    context["raw_appendix"] = _build_raw_appendix(context, klines_by_timeframe)
 
     if include_charts and chart_generator_cls is not None:
         chart_generator = chart_generator_cls(output_dir=charts_path, bars_by_timeframe=CHART_BARS)
@@ -581,7 +778,7 @@ def write_outputs(
     _cleanup_alternate_prompt_output(report_path)
 
     system_path = report_path.with_name(SYSTEM_PROMPT_FILE.name)
-    system_text = gen.ANALYSIS_SYSTEM_PROMPT
+    system_text = gen.build_system_prompt(stage="decision", include_vision=False)
     with system_path.open("w", encoding="utf-8") as f:
         f.write(system_text)
 
@@ -608,6 +805,86 @@ def write_summary_output(context: Dict, context_path: Path) -> Path:
     return summary_path
 
 
+def _resolve_related_output_path(anchor_path: Path, default_path: Path) -> Path:
+    if anchor_path.parent == default_path.parent:
+        return default_path
+    return anchor_path.parent / default_path.name
+
+
+def _parse_research_handoff(text: str) -> Dict[str, Any]:
+    def _repair_json_brackets(source: str) -> str:
+        repaired: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        for ch in source:
+            if in_string:
+                repaired.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                repaired.append(ch)
+                continue
+
+            if ch == "{":
+                stack.append("}")
+                repaired.append(ch)
+                continue
+            if ch == "[":
+                stack.append("]")
+                repaired.append(ch)
+                continue
+            if ch in "}]":
+                if stack:
+                    expected = stack.pop()
+                    repaired.append(expected)
+                else:
+                    repaired.append(ch)
+                continue
+            repaired.append(ch)
+
+        while stack:
+            repaired.append(stack.pop())
+        return "".join(repaired)
+
+    raw = (text or "").strip()
+    candidates: list[str] = []
+    if raw:
+        candidates.append(raw)
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
+        if fenced:
+            candidates.append(fenced.group(1).strip())
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(raw[start : end + 1].strip())
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            try:
+                repaired = _repair_json_brackets(candidate)
+                obj = json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(obj, dict):
+            return obj
+
+    return {
+        "stage": "research",
+        "parse_error": "invalid_json",
+        "raw_text": raw,
+    }
+
+
 def _load_ai_advisor():
     try:
         try:
@@ -619,9 +896,15 @@ def _load_ai_advisor():
         return None
 
 
-def _ordered_chart_items_for_ai(context: Dict) -> list[tuple[str, str]]:
+def _ordered_chart_items_for_ai(
+    context: Dict,
+    stage: str = "research",
+) -> list[tuple[str, str]]:
     """(标签, 路径) 顺序与多周期由大到小，便于模型读图。"""
-    order = ("4h", "1h", "15m", "5m", "spot_perp")
+    if stage == "decision":
+        order = ("4h", "1h", "15m", "spot_perp")
+    else:
+        order = ("4h", "1h", "15m", "5m", "spot_perp")
     cf = context.get("chart_files") or {}
     items: list[tuple[str, str]] = []
     for k in order:
@@ -634,9 +917,11 @@ def _ordered_chart_items_for_ai(context: Dict) -> list[tuple[str, str]]:
 def _run_ai_analysis(
     api_key: str,
     model: str,
-    prompt_text: str,
+    system_prompt: str,
+    user_prompt: str,
     base_url: str | None = None,
     chart_items: list[tuple[str, str]] | None = None,
+    stage_name: str = "decision",
 ) -> str:
     AIAdvisor = _load_ai_advisor()
     if AIAdvisor is None:
@@ -650,9 +935,13 @@ def _run_ai_analysis(
             pp = _P(p)
             if pp.is_file() and pp.suffix.lower() == ".png":
                 n_img += 1
-    token_est = advisor.estimate_tokens(prompt_text, num_images=n_img)
-    print(f"estimated prompt tokens (含图约估): ~{token_est}")
-    analysis = advisor.analyze(prompt_text, chart_items=chart_items or None)
+    token_est = advisor.estimate_tokens(system_prompt + "\n\n" + user_prompt, num_images=n_img)
+    print(f"estimated {stage_name} prompt tokens (含图约估): ~{token_est}")
+    analysis = advisor.analyze_with_messages(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        chart_items=chart_items or None,
+    )
     if not analysis or not analysis.strip():
         raise RuntimeError("AI analysis returned empty content; output file was not updated")
     return analysis
@@ -729,6 +1018,34 @@ def _resolve_analysis_path(context_path: Path) -> Path:
     if context_path.parent == AI_ANALYSIS_FILE.parent:
         return AI_ANALYSIS_FILE
     return context_path.parent / AI_ANALYSIS_FILE.name
+
+
+def _resolve_research_prompt_path(report_path: Path) -> Path:
+    return _resolve_related_output_path(report_path, RESEARCH_PROMPT_FILE)
+
+
+def _resolve_research_system_path(report_path: Path) -> Path:
+    return _resolve_related_output_path(report_path, RESEARCH_SYSTEM_FILE)
+
+
+def _resolve_decision_prompt_path(report_path: Path) -> Path:
+    return _resolve_related_output_path(report_path, DECISION_PROMPT_FILE)
+
+
+def _resolve_decision_system_path(report_path: Path) -> Path:
+    return _resolve_related_output_path(report_path, DECISION_SYSTEM_FILE)
+
+
+def _resolve_research_analysis_path(context_path: Path) -> Path:
+    return _resolve_related_output_path(context_path, AI_RESEARCH_FILE)
+
+
+def _resolve_research_handoff_path(context_path: Path) -> Path:
+    return _resolve_related_output_path(context_path, RESEARCH_HANDOFF_FILE)
+
+
+def _resolve_decision_analysis_path(context_path: Path) -> Path:
+    return _resolve_related_output_path(context_path, AI_DECISION_FILE)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1155,7 +1472,8 @@ def _run_once(args: argparse.Namespace) -> int:
                 logger.error("--auto-analyze requires %s to be set", key_env_name)
                 return 1
             model = args.ai_model or default_model
-            chart_items = None
+            research_chart_items = None
+            decision_chart_items = None
             if not args.no_ai_charts:
                 if provider == "deepseek":
                     logger.info(
@@ -1163,27 +1481,93 @@ def _run_once(args: argparse.Namespace) -> int:
                         "看图请改用: --ai-provider openai --ai-model gpt-4o-mini"
                     )
                 else:
-                    chart_items = _ordered_chart_items_for_ai(context)
-                    if chart_items:
+                    research_chart_items = _ordered_chart_items_for_ai(context, stage="research")
+                    decision_chart_items = _ordered_chart_items_for_ai(context, stage="decision")
+                    if research_chart_items:
                         logger.info(
-                            "auto-analyze 将附带 K 线图: %s",
-                            ", ".join(f"{a}→{Path(b).name}" for a, b in chart_items),
+                            "research 阶段将附带 K 线图: %s",
+                            ", ".join(f"{a}→{Path(b).name}" for a, b in research_chart_items),
                         )
                     else:
                         logger.info(
-                            "auto-analyze: 无可用图表（可装 matplotlib 或去掉 --no-charts）"
+                            "research 阶段: 无可用图表（可装 matplotlib 或去掉 --no-charts）"
                         )
-            logger.info("sending prompt to %s/%s for analysis...", provider, model)
-            prompt_text = PromptGenerator().build(
-                ai_context, report_mode=args.report_mode, include_instructions=False,
+                    if decision_chart_items:
+                        logger.info(
+                            "decision 阶段将附带关键图表: %s",
+                            ", ".join(f"{a}→{Path(b).name}" for a, b in decision_chart_items),
+                        )
+            gen = PromptGenerator()
+
+            research_system = gen.build_system_prompt(
+                stage="research",
+                include_vision=bool(research_chart_items),
             )
+            research_prompt = gen.build_research_prompt(ai_context, include_instructions=False)
+            research_system_path = _resolve_research_system_path(report_path)
+            research_prompt_path = _resolve_research_prompt_path(report_path)
+            research_system_path.write_text(research_system, encoding="utf-8")
+            research_prompt_path.write_text(research_prompt, encoding="utf-8")
+            logger.info("sending research prompt to %s/%s for analysis...", provider, model)
+            research_text = _run_ai_analysis(
+                ai_api_key,
+                model,
+                system_prompt=research_system,
+                user_prompt=research_prompt,
+                base_url=base_url,
+                chart_items=research_chart_items,
+                stage_name="research",
+            )
+            research_analysis_path = _resolve_research_analysis_path(context_path)
+            research_analysis_path.parent.mkdir(parents=True, exist_ok=True)
+            research_analysis_path.write_text(research_text, encoding="utf-8")
+            logger.info("AI research written to %s", research_analysis_path)
+
+            research_handoff = _parse_research_handoff(research_text)
+            research_handoff_text = json.dumps(research_handoff, ensure_ascii=False, indent=2)
+            research_handoff_path = _resolve_research_handoff_path(context_path)
+            research_handoff_path.write_text(research_handoff_text, encoding="utf-8")
+            logger.info("AI research handoff written to %s", research_handoff_path)
+
+            decision_system = gen.build_system_prompt(
+                stage="decision",
+                include_vision=bool(decision_chart_items),
+            )
+            decision_prompt = gen.build_decision_prompt(
+                ai_context,
+                research_handoff=research_handoff_text,
+                report_mode=args.report_mode,
+                include_instructions=False,
+            )
+            decision_system_path = _resolve_decision_system_path(report_path)
+            decision_prompt_path = _resolve_decision_prompt_path(report_path)
+            decision_system_path.write_text(decision_system, encoding="utf-8")
+            decision_prompt_path.write_text(decision_prompt, encoding="utf-8")
+            report_path.with_name(SYSTEM_PROMPT_FILE.name).write_text(decision_system, encoding="utf-8")
+            logger.info("sending decision prompt to %s/%s for analysis...", provider, model)
             analysis = _run_ai_analysis(
-                ai_api_key, model, prompt_text, base_url=base_url, chart_items=chart_items
+                ai_api_key,
+                model,
+                system_prompt=decision_system,
+                user_prompt=decision_prompt,
+                base_url=base_url,
+                chart_items=decision_chart_items,
+                stage_name="decision",
             )
+            decision_analysis_path = _resolve_decision_analysis_path(context_path)
+            decision_analysis_path.parent.mkdir(parents=True, exist_ok=True)
+            decision_analysis_path.write_text(analysis, encoding="utf-8")
+            logger.info("AI decision written to %s", decision_analysis_path)
             analysis_path = _resolve_analysis_path(context_path)
             analysis_path.parent.mkdir(parents=True, exist_ok=True)
             analysis_path.write_text(analysis, encoding="utf-8")
             logger.info("AI analysis written to %s", analysis_path)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts_analysis_path = analysis_path.with_name(
+                f"{analysis_path.stem}_{ts}{analysis_path.suffix}"
+            )
+            ts_analysis_path.write_text(analysis, encoding="utf-8")
+            logger.info("AI analysis archived to %s", ts_analysis_path.name)
             print("\n" + "=" * 60)
             print(analysis)
             print("=" * 60)

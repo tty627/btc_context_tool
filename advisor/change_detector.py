@@ -17,6 +17,11 @@ logger = logging.getLogger("btc_context.change_detector")
 
 _DEFAULT_STATE_FILE = Path(__file__).resolve().parents[1] / "output" / ".last_analysis_state.json"
 
+try:
+    from .analysis_parser import analysis_has_actionable_signal
+except ImportError:
+    from advisor.analysis_parser import analysis_has_actionable_signal  # type: ignore
+
 
 class ChangeDetector:
     """Compare current context against the last snapshot to decide
@@ -92,22 +97,18 @@ class ChangeDetector:
             if prev_trend.get(tf) != state:
                 reasons.append(f"trend change: {tf} {prev_trend.get(tf, '?')}->{state}")
 
+        cur_quality = self._extract_quality_signature(context)
+        prev_quality = prev.get("quality_signature", {})
+        for key, cur_val in cur_quality.items():
+            if prev_quality.get(key) != cur_val:
+                reasons.append(f"quality change: {key}")
+
         if reasons:
             return True, reasons
         return False, []
 
     def save_state(self, context: Dict, analysis_text: str = "") -> None:
-        had_signal = False
-        if analysis_text:
-            wait_markers = (
-                "execution_mode: wait", "execution_mode:wait",
-                "主结论: 等待", "主结论: 不交易", "主结论:等待", "主结论:不交易",
-            )
-            has_plan = ("pullback_plan:" in analysis_text
-                        or "trigger_plan:" in analysis_text
-                        or "immediate_entry_plan:" in analysis_text)
-            is_wait = any(m in analysis_text or m in analysis_text.lower() for m in wait_markers)
-            had_signal = has_plan and not is_wait
+        had_signal = analysis_has_actionable_signal(analysis_text) if analysis_text else False
 
         state = {
             "timestamp": time.time(),
@@ -116,11 +117,12 @@ class ChangeDetector:
             "session": context.get("session_context", {}).get("current_session", ""),
             "gates": self._extract_gates(context),
             "trend": self._extract_trend(context),
+            "quality_signature": self._extract_quality_signature(context),
             "had_actionable_signal": had_signal,
         }
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(state), encoding="utf-8")
+            self.state_file.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         except OSError as exc:
             logger.warning("failed to save analysis state: %s", exc)
 
@@ -157,3 +159,42 @@ class ChangeDetector:
         if isinstance(ms, dict):
             return {k: str(v) for k, v in ms.items()}
         return {}
+
+    @staticmethod
+    def _extract_quality_signature(context: Dict) -> Dict[str, str]:
+        trade_flow = context.get("trade_flow", {})
+        pld = trade_flow.get("price_level_delta", {}) if isinstance(trade_flow, dict) else {}
+        transition = context.get("transition", {})
+        spot_perp = context.get("spot_perp", {})
+        oi_trend = context.get("open_interest_trend", {})
+        current_price = float(context.get("price", 0) or 0)
+
+        stacked = []
+        if isinstance(pld, dict):
+            stacked = pld.get("stacked_imbalance", []) or []
+        stacked_signature = "|".join(
+            f"{row.get('direction', '?')}:{round(float(row.get('from_price', 0) or 0))}-{round(float(row.get('to_price', 0) or 0))}"
+            for row in stacked[:2]
+        ) or "none"
+
+        near_flows = []
+        for row in trade_flow.get("key_level_flows", [])[:8]:
+            level_price = float(row.get("price", 0) or 0)
+            if current_price > 0 and level_price > 0:
+                dist = abs(level_price - current_price) / max(current_price, 1.0)
+                if dist <= 0.006:
+                    near_flows.append(f"{row.get('name', '?')}:{row.get('tag', '?')}")
+        if not near_flows:
+            near_flows = [
+                f"{row.get('name', '?')}:{row.get('tag', '?')}"
+                for row in trade_flow.get("key_level_flows", [])[:2]
+            ]
+
+        return {
+            "oi_state": str(oi_trend.get("latest_state", "unknown")),
+            "spot_basis_signal": str(spot_perp.get("basis_signal", "unknown")),
+            "spot_cvd_state": str(spot_perp.get("cvd_state", "unknown")),
+            "cvd_momentum": str(transition.get("cvd_dynamics", {}).get("momentum", "unknown")),
+            "footprint_stack": stacked_signature,
+            "near_level_flow": "|".join(near_flows) if near_flows else "none",
+        }

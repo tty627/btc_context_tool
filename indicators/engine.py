@@ -125,8 +125,14 @@ class IndicatorEngine:
         lows: List[float],
         closes: List[float],
         period: int = 14,
+        pct_rank_lookback: int = 30,
     ) -> Dict[str, float]:
-        """Average True Range — used for stop-loss sizing and position management."""
+        """Average True Range — used for stop-loss sizing and position management.
+
+        Also computes pct_rank_30 — the percentile rank of current ATR within
+        the most recent *pct_rank_lookback* ATR values, indicating whether
+        volatility is currently low (<30), mid (30-70), or high (>70).
+        """
         if not highs or len(highs) != len(lows) or len(highs) != len(closes):
             return {"atr": 0.0, "atr_pct": 0.0}
 
@@ -148,12 +154,35 @@ class IndicatorEngine:
 
         current_price = closes[-1] if closes else 1.0
         atr_pct = (atr / current_price * 100) if current_price else 0.0
-        return {
+
+        # Rolling ATR series for percentile rank
+        pct_rank: float | None = None
+        if len(true_ranges) >= period + pct_rank_lookback:
+            # Compute ATR at each of the last pct_rank_lookback positions
+            rolling_atrs: List[float] = []
+            start = len(true_ranges) - pct_rank_lookback
+            # Rebuild ATR up to start position
+            r_atr = sum(true_ranges[:period]) / period
+            for tr in true_ranges[period:start]:
+                r_atr = (r_atr * (period - 1) + tr) / period
+            rolling_atrs.append(r_atr)
+            for tr in true_ranges[start:]:
+                r_atr = (r_atr * (period - 1) + tr) / period
+                rolling_atrs.append(r_atr)
+            # Percentile rank: how many historical values is current ATR >= ?
+            current_atr_val = rolling_atrs[-1]
+            rank = sum(1 for v in rolling_atrs[:-1] if current_atr_val >= v)
+            pct_rank = round(rank / max(len(rolling_atrs) - 1, 1) * 100, 1)
+
+        result = {
             "atr": round(atr, 6),
             "atr_pct": round(atr_pct, 6),
             "suggested_sl_distance": round(atr * 1.5, 6),
             "suggested_sl_pct": round(atr_pct * 1.5, 6),
         }
+        if pct_rank is not None:
+            result["pct_rank_30"] = pct_rank
+        return result
 
     def calculate_bollinger_bands(
         self,

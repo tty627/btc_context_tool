@@ -5,6 +5,7 @@ mixin classes for maintainability.  This module re-exports the composed class
 so existing callers (main.py, etc.) continue to work unchanged.
 """
 
+from .candle_structure import CandleStructureMixin
 from .deployment import DeploymentMixin
 from .derivatives import DerivativesMixin
 from .liquidation import LiquidationMixin
@@ -32,6 +33,7 @@ class FeatureExtractor(
     PositionSizingMixin,
     SignalScoreMixin,
     SpotPerpMixin,
+    CandleStructureMixin,
 ):
     """All feature-extraction capabilities composed via mixins.
 

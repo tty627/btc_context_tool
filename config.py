@@ -6,7 +6,7 @@ TIMEFRAMES = ("15m", "1h", "4h", "1d")
 
 KLINE_LIMIT = 200
 DEPTH_LIMIT = 20
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 30
 BINANCE_API_KEY_ENV = "BINANCE_API_KEY"
 BINANCE_API_SECRET_ENV = "BINANCE_API_SECRET"
 
@@ -16,7 +16,9 @@ HTTPS_PROXY_ENV = "HTTPS_PROXY"
 HTTP_PROXY_ENV = "HTTP_PROXY"
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
-OPENAI_MODEL = "gpt-4o"
+# Primary OpenAI model; if unavailable, AIAdvisor can fall back in order.
+OPENAI_MODEL = "gpt-5"
+OPENAI_FALLBACK_MODELS = ("gpt-4o",)
 OPENAI_TEMPERATURE = 0.3
 OPENAI_MAX_TOKENS = 4096
 
@@ -37,6 +39,13 @@ SYSTEM_PROMPT_FILE = OUTPUT_DIR / "btc_system.txt"
 SUMMARY_FILE = OUTPUT_DIR / "btc_summary.md"
 CHART_DIR = OUTPUT_DIR / "charts"
 AI_ANALYSIS_FILE = OUTPUT_DIR / "btc_ai_analysis.md"
+RESEARCH_PROMPT_FILE = OUTPUT_DIR / "btc_research_prompt.txt"
+RESEARCH_SYSTEM_FILE = OUTPUT_DIR / "btc_research_system.txt"
+AI_RESEARCH_FILE = OUTPUT_DIR / "btc_ai_research.md"
+RESEARCH_HANDOFF_FILE = OUTPUT_DIR / "btc_research_handoff.json"
+DECISION_PROMPT_FILE = OUTPUT_DIR / "btc_decision_prompt.txt"
+DECISION_SYSTEM_FILE = OUTPUT_DIR / "btc_decision_system.txt"
+AI_DECISION_FILE = OUTPUT_DIR / "btc_ai_decision.md"
 
 CHART_BARS = {
     "4h": 120,

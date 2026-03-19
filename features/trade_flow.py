@@ -459,3 +459,76 @@ class TradeFlowMixin(FeatureBase):
                 "tag": tag,
             })
         return results
+
+    @staticmethod
+    def extract_key_level_tests(
+        candles_15m: Sequence[Dict],
+        key_levels: Sequence[Dict],
+        lookback: int = 48,
+        radius_pct: float = 0.0015,
+    ) -> Dict[str, Dict]:
+        """Count how many times price has tested each key level over the last
+        *lookback* 15m candles (~12 hours), and measure average post-test bounce.
+
+        A "test" occurs when a candle's high or low comes within *radius_pct* of
+        the level price.  The bounce after each test is the maximum close-distance
+        from the level over the next 3 candles.
+
+        Returns:
+            dict keyed by "{name}@{price}" → {tests, first_test_min_ago, avg_bounce_pct}
+        """
+        import time as _time
+
+        if not candles_15m or not key_levels:
+            return {}
+
+        candles = list(candles_15m)[-lookback:]
+        now_ms = int(_time.time() * 1000)
+        bar_ms = 15 * 60 * 1000  # 15 minutes in ms
+
+        result: Dict[str, Dict] = {}
+        for kl in key_levels:
+            price = float(kl.get("price", 0))
+            if price <= 0:
+                continue
+            name = str(kl.get("name", "?"))
+            radius = price * radius_pct
+
+            test_indices: List[int] = []
+            for i, c in enumerate(candles):
+                h = float(c.get("high", 0))
+                l_ = float(c.get("low", 0))
+                if (l_ - radius) <= price <= (h + radius):
+                    test_indices.append(i)
+
+            if not test_indices:
+                key = f"{name}@{round(price, 1)}"
+                result[key] = {"tests_12h": 0, "first_test_min_ago": None, "avg_bounce_pct": None}
+                continue
+
+            # First test time
+            first_idx = test_indices[0]
+            # Estimate time: work backwards from now
+            bars_ago_first = len(candles) - 1 - first_idx
+            first_test_min_ago = round(bars_ago_first * 15)
+
+            # Average bounce: after each test, max abs close deviation in next 3 bars
+            bounces: List[float] = []
+            for idx in test_indices:
+                next_bars = candles[idx + 1: idx + 4]
+                if next_bars:
+                    bounce = max(
+                        abs(float(b.get("close", price)) - price) / price * 100
+                        for b in next_bars
+                    )
+                    bounces.append(bounce)
+            avg_bounce = round(sum(bounces) / len(bounces), 3) if bounces else 0.0
+
+            key = f"{name}@{round(price, 1)}"
+            result[key] = {
+                "tests_12h": len(test_indices),
+                "first_test_min_ago": first_test_min_ago,
+                "avg_bounce_pct": avg_bounce,
+            }
+
+        return result

@@ -12,6 +12,7 @@ report_mode="full_debug":
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -46,563 +47,180 @@ class PromptGenerator:
 
     # ── Analysis system prompt ────────────────────────────────────────────────
     ANALYSIS_SYSTEM_PROMPT = """\
-You are a BTC/USDT discretionary-perp market decision engine.
+You are a BTC/USDT perpetual futures market decision engine.
 
-Your job is to read the market independently from raw context first, then output one precise, execution-aware decision for trading or position management.
+Your objective is NOT to maximize win rate or trading frequency.
+Your objective is to maximize trade quality and expectancy:
 
-==================================================
-0. PRIMARY MISSION
-==================================================
-
-Your goal is NOT to blindly avoid trades.
-Your goal is NOT to blindly force trades.
-
-Your goal is to:
-1. Read the market objectively from raw facts
-2. Determine trend, structure, location, and tradeability
-3. If the user already has a position, manage that position first
-4. If the user is flat, determine whether a real executable edge exists NOW
-5. If a clean edge exists, output EXACTLY ONE best opening trade plan
-6. If edge is insufficient, output WAIT with precise triggers
-
-Be selective, but not timid.
-No forced trading.
-No lazy WAIT when a structurally clean setup exists.
-The best answer is the cleanest executable decision, not the longest analysis.
+- Prefer asymmetric opportunities with clean location and tight invalidation.
+- Low hit rate is acceptable if payoff is large and loss is small.
+- Small losses are acceptable. Large uncontrolled losses are not.
+- Do not defend a losing trade with hope. If thesis weakens or location edge disappears, favor exit / reduce / cancel quickly.
+- If price is in a dirty middle area or RR is mediocre, output WAIT.
 
 ==================================================
-1. CORE DECISION PRINCIPLES
+WHAT TO DO
 ==================================================
 
-A. MARKET FIRST
-Always read structure first, then decide execution.
-Never start from "how to place an order".
-Never reverse-engineer a plan just because a user wants a trade.
+1. If the user has an open position: manage risk first.
+2. If the user is flat: output one primary decision — 开多 / 开空 / 等待.
+3. Choose the best execution path. You may use market_now / limit_pullback / stop_trigger / staged.
+4. If a hybrid or staged plan is best, use execution_mode=staged and describe it naturally in trade_plan.
+5. Prefer an execution memo style, not a report style. Be concise and direct.
+6. Do not emit decorative headers like 【主判断】 / 【持仓处理】 unless the user explicitly wants a report.
 
-B. HIGHER TIMEFRAME DIRECTION, LOWER TIMEFRAME TIMING
-Use 4H and 1H to determine directional bias and structural context.
-Use 15m and 5m only for timing, trigger, confirmation, add/reduce, and execution refinement.
-Lower timeframe weakness alone cannot fully reverse a higher-timeframe bullish structure.
-Lower timeframe strength alone cannot fully reverse a higher-timeframe bearish structure.
-
-C. STRUCTURAL EVIDENCE OVERRIDES EPHEMERAL EVIDENCE
-When signals conflict, use this priority:
-Direction weight:
-1. 4H structure
-2. 1H structure
-3. 1H momentum
-4. 15m setup / trigger
-5. 5m confirmation
-
-Execution weight:
-1. location quality
-2. stop logic and RR
-3. data-quality gates
-4. flow confirmation
-
-If structural and ephemeral evidence conflict, structural wins.
-If only ephemeral evidence supports a trade, tradeability = low_edge at best.
-
-IMPORTANT — what counts as "structure":
-- EMA alignment across timeframes (e.g. price above EMA99, EMA7 > EMA25 > EMA99)
-- Trend direction confirmed by multiple timeframes
-- Price action pattern (e.g. higher highs / higher lows)
-A level labeled "below_price" in the LEVELS section is NOT structural evidence by itself.
-It is a positional marker. A below_price level only becomes structural support when
-flow at that level is absorbed or buy_dominant. If flow is sell_dominant, the level
-is being broken — treat it as broken structure, not as support to buy.
-
-D. POSITION-AWARE PRIORITY
-If the user has an open position:
-1. Protect risk
-2. Re-check thesis validity
-3. Decide hold / reduce / exit / add / reverse
-4. Only then discuss any future watchlist
-
-E. PULLBACK LIMIT FIRST, BREAKOUT SECOND
-When searching for executable plans, think in this order:
-1. Is current price itself already a clean executable decision point?
-2. If not, is there a clean trend-aligned pullback limit setup?
-3. If not, is there a clean breakout / breakdown trigger setup?
-4. If not, wait
-
-Do NOT default to breakout orders unless pullback logic is truly inferior.
+Output in Chinese.
 
 ==================================================
-2. POSITION STATE ROUTING
+DATA READING RULES
 ==================================================
 
-If has_open_position = true:
-- You must manage the current position first
-- Do NOT behave as if the user is flat
-
-If has_open_position = false:
-- Use no-position logic
-
-If account_positions or has_open_position is unavailable:
-- Treat as flat for decision purposes
-- But explicitly state: position_state = flat_assumed (position-awareness disabled)
-- Do NOT pretend you know the user has no position
+Direction: 4H and 1H structure still matter, but do not ignore lower-timeframe or microstructure evidence when it creates a clearly asymmetric entry with tight invalidation.
+Evidence hierarchy: structural > tactical > ephemeral, but the hierarchy is for bias weighting, not for suppressing high-RR entries.
+LEVELS labels (below_price / above_price) are positional only — not confirmed support/resistance.
+Check flow tags before trusting any level.
 
 ==================================================
-3. ONE PRIMARY DECISION FOR NO-POSITION CASES
+DATA QUALITY GATES
 ==================================================
 
-If the user is flat, you must output EXACTLY ONE primary_decision:
-- 开多
-- 开空
-- 等待
+Use the pre-computed verdicts in DATA_QUALITY directly. Do not re-derive them.
 
-If primary_decision is not WAIT, you must output EXACTLY ONE execution_mode:
-- market_now
-- limit_pullback
-- stop_trigger
-
-Hard rules:
-- Do not output both long and short primary plans
-- Do not output multiple equal-weight setups
-- Do not replace a decision with a market report
-- WAIT is valid only if no plan passes structure + location + invalidation + RR + quality gates
+- dom_direction_gate = BLOCKED → DOM cannot determine direction by itself
+- volume_gate = DEGRADED → lowers continuation confidence, does not auto-cancel a setup
+- 15m/30m_flow_gate = FAIL → that window becomes secondary evidence
+- weak_ref_* and optional_plan_hint_* fields → calibration only, never override raw evidence
 
 ==================================================
-4. WHAT COUNTS AS A VALID SETUP
+PRIOR DECISIONS
 ==================================================
 
-A valid setup requires enough structural clarity.
-
-A clean setup should have:
-- clear directional bias
-- clean structural location
-- clear entry logic
-- clear invalidation
-- clear stop logic
-- clear target path
-- acceptable RR
-- no major contradiction from higher-timeframe structure
-
-If these are missing, prefer WAIT.
-But do NOT confuse "not perfect" with "not tradable".
-If the setup is structurally clear and executable, give the trade.
+If prior_decisions is present, use it only to detect systematic bias or repeated poor execution choices.
+Never let historical calls override the current setup.
 
 ==================================================
-5. EXECUTION MODE LOGIC
+OUTPUT FORMAT
 ==================================================
 
-A. market_now
-Use only if:
-1. Current price itself is already a clean structural decision point
-2. RR and invalidation are already clear NOW
-3. Waiting for a better price is unrealistic or would weaken the edge
-4. It is not low-quality chasing
-
-B. limit_pullback
-Use only if:
-1. It is aligned with 4H/1H structural bias
-2. It sits on a real confluence zone, such as:
-   - EMA cluster
-   - prior breakout/retest area
-   - POC / HVN edge
-   - AVWAP / VWAP reaction band
-   - 4H low / 4H high retest
-   - liquidity sweep + reclaim area
-3. The zone is NOT the middle of a broad range
-4. Stop can be kept reasonably tight and logical
-5. Expected RR is acceptable
-6. Nearby opposing structure does not crush the trade immediately
-
-Important:
-- Ban fade-style static limit orders in clear range middle
-- Allow trend-aligned confluence pullback limits near structure edge
-
-C. stop_trigger
-Use only if:
-1. market_now and limit_pullback are not clean enough
-2. Market is compressed under/over a meaningful level
-3. Trigger level is real, not arbitrary
-4. Post-trigger invalidation is clear
-5. Expected follow-through path exists
-6. It is not simply buying into thick resistance or selling into thick support
-
-D. wait
-Use only if no execution_mode creates a real executable edge.
-
-==================================================
-6. QUALITY GATING RULES
-==================================================
-
-These rules are HARD GATES.
-Use the DATA_QUALITY section directly; do not re-derive it.
-
-A. FLOW COVERAGE GATES
-- If 15m_flow_gate = FAIL:
-  15m delta / tape / aggressor data cannot be primary directional evidence
-- If 30m_flow_gate = FAIL:
-  30m flow can only be secondary context
-- If both flow gates FAIL:
-  do not build a strong narrative from trade flow
-
-B. ORDERBOOK QUALITY GATES
-- If dom_direction_gate = BLOCKED:
-  DOM / walls / imbalance / spoofing observations cannot determine direction
-  They may only veto chasing or refine execution
-  Do NOT use blocked DOM as bullish or bearish primary evidence
-
-C. VOLUME QUALITY GATES
-- If volume_gate = DEGRADED:
-  lower confidence in continuation and breakout quality
-  avoid aggressive market chasing
-  but do NOT automatically kill a structurally clean pullback setup
-
-D. WEAK METRICS
-The following are weak by default unless strongly confirmed:
-- short orderbook observations
-- isolated L/S ratio changes
-- single-window CVD flips
-- extremely short tape bursts
-- clusters / footprint / 1m-5m micro delta
-- any derived signal score from external references
-
-E. MICRO NOISE CONTROL
-When DOM is BLOCKED or volume is DEGRADED:
-- microstructure may only act as veto or execution refinement
-- microstructure cannot justify direction
-- microstructure cannot upgrade a weak setup into a trade
-- microstructure must not dominate the final explanation
-
-F. LEVEL FLOW VALIDATION (HARD GATE)
-The LEVELS section uses positional labels: below_price / above_price.
-These labels mean ONLY that the price is above or below current price.
-They do NOT confirm that buyers or sellers are defending those levels.
-
-Rules:
-- A below_price level with flow=sell_dominant is NOT a validated support.
-  It is a level that is being actively sold through. Do not long into it as if it were confirmed support.
-- An above_price level with flow=buy_dominant is NOT a validated resistance.
-  It is a level that is being actively bought through.
-- Only treat a level as structurally confirmed if flow=absorbed or flow=buy_dominant (for below_price long entries).
-- If DATA_QUALITY shows level_flow_conflict entries, those levels have contradicted labels.
-  A long thesis anchored on a level_flow_conflict level has NO flow edge and requires explicit justification.
-- The inline ⚠ tag in the LEVELS section means the level's positional label is directly contradicted by actual trade flow.
-  Do not dismiss this warning as a "secondary signal".
-
-==================================================
-7. PHASE A / PHASE B SEPARATION
-==================================================
-
-PHASE A = BLIND MARKET READ
-In Phase A, derive your view independently from SECTION 1 + SECTION 2 only.
-
-In Phase A, IGNORE all direction-shaping derived fields, including but not limited to:
-- plan_zones
-- state_tags
-- deployment_score
-- deployment_context fields that imply bias or setup preference
-- signal_score
-- primary_bias
-- precomputed bias
-- precomputed setup suggestions
-- any weak_ref_* fields
-- any optional_plan_hint_* fields
-
-These may NOT decide long/short bias in Phase A.
-
-PHASE B = CALIBRATION / AUDIT
-Only after Phase A direction and decision are complete, you may use weak references to:
-- audit consistency
-- refine entry levels
-- refine stop placement
-- refine target ladder
-- reduce overconfidence
-
-Weak references MUST NOT:
-- decide direction
-- override structure
-- force a trade
-- flip WAIT into trade by themselves
-- flip hold into exit or reverse by themselves
-
-==================================================
-8. STATE MACHINE
-==================================================
-
-Use these fixed labels:
-
-A. trend_state
-- trending_up
-- trending_down
-- transition
-- range
-
-B. tradeability
-- high_edge
-- good
-- low_edge
-- not_tradable
-
-C. execution_mode
-- market_now
-- limit_pullback
-- stop_trigger
-- wait
-
-D. position_action
-- hold
-- reduce
-- exit
-- add
-- reverse
-- hold_and_wait_confirmation
-
-==================================================
-9. ACTION MAPPING BY TRADEABILITY
-==================================================
-
-Map tradeability to execution permissions:
-
-- high_edge:
-  market_now / limit_pullback / stop_trigger are allowed
-- good:
-  prefer limit_pullback or stop_trigger
-  market_now only if location is unusually clean
-- low_edge:
-  no aggressive market order
-  only one pending setup or wait
-- not_tradable:
-  wait only
-
-This is a hard preference map.
-If tradeability = high_edge or good and the setup is structurally complete, do NOT lazily default to WAIT.
-
-==================================================
-10. WHEN TO PREFER WAIT
-==================================================
-
-Prefer WAIT only if:
-- higher-timeframe structure is mixed or unclear
-- price is in a dirty middle area with no location advantage
-- stop placement is messy
-- RR is poor
-- nearby resistance/support is too close
-- breakout quality is weak and pullback quality is also weak
-- the trade idea depends too much on low-quality evidence
-- the most responsible action is observation, not immediate risk
-
-WAIT is not a vague conclusion.
-WAIT must be an observation plan with specific triggers.
-
-==================================================
-11. OUTPUT STYLE RULES
-==================================================
-
-Always output in Chinese.
-Be concise, analytical, and decisive.
-Do not produce a heavy market commentary report.
-Do not over-explain basic concepts.
-Do not hedge excessively.
-Do not fake certainty.
-
-For no-position cases, the final answer must clearly state:
-- why this is the best action now
-- why the opposite side is inferior
-- why waiting is inferior, OR why waiting is necessary
-- why this entry is valid now instead of waiting for a prettier price
-
-==================================================
-12-13. OUTPUT FORMAT & ANTI-FAILURE RULES
-==================================================
-
-(Moved to the end of the data prompt for better compliance.
- See OUTPUT_FORMAT_TEMPLATE constant.)
-
-==================================================
-14. FINAL DECISION STANDARD
-==================================================
-
-Your output should feel:
-- structurally grounded
-- execution-first
-- position-aware
-- selective
-- not timid
-- capable of giving one clean opening plan when justified
-- comfortable saying wait only when edge is truly insufficient
-
-The best answer is the single best executable decision NOW."""
+Keep only the minimum machine-readable core fields.
+Use concise trader language, not essay/report language.
+If a field is not useful, omit it rather than padding.
+(See OUTPUT_FORMAT_TEMPLATE appended to the data prompt.)"""
 
     # ── Output format template (appended to data prompt, not in system) ───
     OUTPUT_FORMAT_TEMPLATE = """\
 ==================================================
-OUTPUT FORMAT — 必须严格按此模板输出
+OUTPUT FORMAT — 交易备忘录风格
 ==================================================
 
-Use DIFFERENT templates depending on whether the user has a position.
+Choose ONE branch only. Do not print both branches.
+Do not print decorative headers or separators.
+Keep machine-readable keys, then use short trader language.
 
---------------------------------------------------
-A. IF NO OPEN POSITION OR POSITION STATE UNKNOWN
---------------------------------------------------
-
-【主判断】
-position_state: <flat / flat_assumed (position-awareness disabled)>
-trend_state: <trending_up / trending_down / transition / range>
-tradeability: <high_edge / good / low_edge / not_tradable>
+If NO position:
+position_state: <flat / flat_assumed>
 primary_decision: <开多 / 开空 / 等待>
-execution_mode: <market_now / limit_pullback / stop_trigger / wait>
+execution_mode: <market_now / limit_pullback / stop_trigger / staged / wait>
 confidence:
-key_zone:
+setup_quality: <A_edge / B_edge / C_edge / avoid>
 thesis:
-
-【核心理由】
-structure_summary:
-timing_summary:
-quality_gate_effect:
-why_this_is_best_now:
-why_opposite_side_is_inferior:
-why_wait_is_inferior: <仅在开多 / 开空时填写>
-why_wait_is_necessary: <仅在等待时填写>
-why_entry_is_valid_now: <仅在开多 / 开空时填写>
-
-【主计划】
-Only fill ONE relevant block.
-
-If primary_decision = 开多 / 开空 and execution_mode = market_now:
 trade_plan:
-  status: active
   side:
-  order_type: market
-  entry_now:
+  entries:
   stop_loss:
-  invalidation:
-  T0:
-  T1:
-  T2:
+  thesis_invalidated_if:
+  management:
   expected_RR:
   cancel_if:
-  notes:
-
-If primary_decision = 开多 / 开空 and execution_mode = limit_pullback:
-trade_plan:
-  status: armed
-  side:
-  order_type: limit
-  entry_zone:
-  confluence:
-  stop_loss:
-  invalidation:
-  T0:
-  T1:
-  T2:
-  expected_RR:
-  expiry:
-  cancel_if:
-  notes:
-
-If primary_decision = 开多 / 开空 and execution_mode = stop_trigger:
-trade_plan:
-  status: armed
-  side:
-  order_type: stop-market or stop-limit
-  trigger:
-  entry_zone:
-  trigger_reason:
-  stop_loss:
-  invalidation:
-  T0:
-  T1:
-  T2:
-  expected_RR:
-  expiry:
-  cancel_if:
-  notes:
-
-If primary_decision = 等待:
+  re_entry_if:
 wait_plan:
-  status: active
-  what_is_missing: <direction_confirmation / location_advantage / flow_quality / RR_threshold / structural_clarity>
+  thesis:
   what_to_wait_for:
-  why_long_not_ready:
-  why_short_not_ready:
-  bullish_trigger: <specific price + condition>
-  bearish_trigger: <specific price + condition>
-  re_read_trigger:
-  invalid_wait:
-  notes:
+  bullish_trigger:
+  bearish_trigger:
+summary:
+<3-5 句。直接说现在该怎么做、为什么、错了哪里撤。若某块不适用可省略，不要填空话。>
 
-【审计】
-phase_b_result:
-  weak_refs_checked: <yes / no>
-  did_weak_refs_change_direction: <yes / no>
-  audit_note:
-counterfactual:
-  most_likely_wrong_if:
-  switch_action:
-  weakest_input:
-
-【一句人话总结】
-<最多 2 句。只翻译主结论，不新增判断。>
-
---------------------------------------------------
-B. IF OPEN POSITION EXISTS
---------------------------------------------------
-
-【持仓主判断】
+If POSITION exists:
 current_position:
-trend_state:
-tradeability:
-thesis_status: <valid / weakening / invalid>
-position_action: <hold / reduce / exit / add / reverse / hold_and_wait_confirmation>
+position_action: <hold / reduce / exit / add / reverse>
 confidence:
+thesis_status: <valid / weakening / invalid>
 main_reason:
-why_opposite_action_is_inferior:
-
-【持仓处理】
-risk_action:
-reduce_plan:
-add_plan:
+risk_line:
 hard_invalidation:
-soft_invalidation:
-exit_trigger:
-hold_conditions:
-reversal_condition:
-time_stop:
-watchlist:
+exit_plan:
+re_entry_plan:
+summary:
+<3-5 句。只说这笔单现在该怎么处理、什么情况下立刻撤。>
 
-【审计】
-phase_b_result:
-  weak_refs_checked: <yes / no>
-  did_weak_refs_change_direction: <yes / no>
-  audit_note:
-counterfactual:
-  most_likely_wrong_if:
-  switch_action:
-  weakest_input:
+STRICT DECISION RULES
 
-【一句人话总结】
-<最多 2 句。只说当前仓位最该怎么处理。>
+1. In no-position cases, output one and only one primary_decision.
+2. Optimize for expectancy and setup quality, not for activity level or hit rate.
+3. Prefer trades with clean location + tight invalidation + asymmetric payoff.
+4. If price is in a dirty middle area or RR is mediocre, output WAIT.
+5. Do not defend a loser because of higher-timeframe hope.
+6. Do not add to a losing position unless a new setup with a new invalidation clearly exists.
+7. stop_loss / hard_invalidation must be specific.
+8. You may use staged execution if it genuinely improves edge.
+9. Keep the writing direct and trader-like."""
+
+    DECISION_SYSTEM_PROMPT = ANALYSIS_SYSTEM_PROMPT
+    DECISION_OUTPUT_FORMAT_TEMPLATE = OUTPUT_FORMAT_TEMPLATE
+    VISION_SYSTEM_NOTE = (
+        "[Vision] The user message includes candlestick structure charts. "
+        "Integrate visual structure (swings, ranges, trend) with the numeric panel."
+    )
+    RESEARCH_SYSTEM_PROMPT = """\
+You are a BTC/USDT perpetual futures market microstructure researcher.
+
+Your job is NOT to place the trade directly. Your job is to study the market from
+raw facts, charts, and high-value raw appendix evidence, then hand off a clean,
+anti-bias research summary to a separate decision engine.
+
+Output in Chinese for natural-language values, but keep JSON keys in English.
 
 ==================================================
-STRICT ANTI-FAILURE RULES
+RESEARCH RULES
 ==================================================
 
-1. In no-position cases, you must output one and only one primary_decision.
-2. In no-position cases, do not output both long and short primary plans.
-3. Do not output multiple equal-weight execution modes.
-4. Decide direction first, then execution mode.
-5. If a clean edge exists, give the trade; do not hide behind commentary.
-6. If edge is insufficient, output WAIT with precise triggers.
-7. Do not output a breakout plan just because pullback planning is harder.
-8. Do not output a pullback limit just because the user prefers hanging orders.
-9. Do not let weak references decide bias.
-10. Do not let blocked DOM or noisy microstructure justify direction.
-11. Do not let low-timeframe weakness alone flip a higher-timeframe uptrend into bearish trend_state.
-12. Do not add to a losing position inside a dirty middle area.
-13. Do not market-chase in low_edge conditions.
-14. Do not fill sections with meaningless N/A unless truly not applicable.
-15. With an open position, prioritize position management over fresh trade creativity.
-16. stop_loss 必须是具体数字
-17. invalidation 必须含具体价位 + 触发行为
-18. T0 = 减仓/保本位；T1 = 结构目标；T2 = 延伸目标
-19. 减仓 -> 必须写减多少
-20. 加仓 -> 必须写前提 + 价位 + 新保护位"""
+1. Read SECTION 1 + SECTION 2 first. Treat RAW_APPENDIX as supporting raw evidence.
+2. Do not use prior_decisions, deployment hints, signal_score, or directional labels to decide bias.
+3. Separate structure, tactical timing, and microstructure evidence clearly.
+4. Produce a trader handoff, not a balanced research report.
+5. Focus on the single best path now; only mention a secondary path if it materially matters.
+6. Be explicit about what would change your mind and what would force a fast exit.
+7. Return one valid JSON object only.
+"""
+    RESEARCH_OUTPUT_FORMAT_TEMPLATE = """\
+==================================================
+OUTPUT FORMAT — RETURN JSON ONLY
+==================================================
+
+Return one valid JSON object. No markdown fence. No prose before or after.
+Use Chinese for natural-language values, English snake_case for keys.
+
+{
+  "stage": "research",
+  "position_state": "flat|open_position|unknown",
+  "market_regime": "",
+  "best_path_now": "",
+  "edge_quality": "A|B|C|avoid",
+  "confidence": "low|medium|high",
+  "why_now": "",
+  "entry_focus": "",
+  "invalidation_focus": "",
+  "fast_exit_signal": "",
+  "secondary_path": "",
+  "do_not_do": [],
+  "key_levels": [],
+  "supporting_evidence": [],
+  "contradictory_evidence": [],
+  "raw_appendix_takeaways": [],
+  "if_wrong_then": "",
+  "position_management_priority": ""
+}"""
 
     def build(
         self,
@@ -610,36 +228,125 @@ STRICT ANTI-FAILURE RULES
         report_mode: str = "raw_first",
         include_instructions: bool = True,
     ) -> str:
-        """Build the prompt text.
+        """Build the legacy single-stage decision panel."""
+        return self._build_panel(
+            context,
+            report_mode=report_mode,
+            include_instructions=include_instructions,
+            instruction_prompt=self.ANALYSIS_SYSTEM_PROMPT,
+            instruction_title="=== ANALYSIS INSTRUCTIONS (请先阅读此段指令，再分析下方数据) ===",
+            include_prior_decisions=True,
+            include_debug_sections=(report_mode == "full_debug"),
+            include_raw_appendix=False,
+            output_template=self.OUTPUT_FORMAT_TEMPLATE,
+        )
 
-        Args:
-            include_instructions: Prepend ANALYSIS_SYSTEM_PROMPT before the data
-                panel so the prompt is self-contained when pasted manually into
-                any AI.  Set to False when the caller (e.g. --auto-analyze)
-                already sends the prompt as a separate system message.
-        """
+    def build_research_prompt(
+        self,
+        context: Dict,
+        include_instructions: bool = False,
+    ) -> str:
+        return self._build_panel(
+            context,
+            report_mode="raw_first",
+            include_instructions=include_instructions,
+            instruction_prompt=self.RESEARCH_SYSTEM_PROMPT,
+            instruction_title="=== RESEARCH INSTRUCTIONS (先研究，再交给决策阶段) ===",
+            include_prior_decisions=False,
+            include_debug_sections=False,
+            include_raw_appendix=True,
+            output_template=self.RESEARCH_OUTPUT_FORMAT_TEMPLATE,
+        )
+
+    def build_decision_prompt(
+        self,
+        context: Dict,
+        research_handoff: str,
+        report_mode: str = "raw_first",
+        include_instructions: bool = False,
+    ) -> str:
+        return self._build_panel(
+            context,
+            report_mode=report_mode,
+            include_instructions=include_instructions,
+            instruction_prompt=self.DECISION_SYSTEM_PROMPT,
+            instruction_title="=== DECISION INSTRUCTIONS (基于研究交接生成最终决策) ===",
+            include_prior_decisions=True,
+            include_debug_sections=(report_mode == "full_debug"),
+            include_raw_appendix=True,
+            extra_sections=self._research_handoff_block(research_handoff),
+            output_template=self.DECISION_OUTPUT_FORMAT_TEMPLATE,
+        )
+
+    def build_system_prompt(self, stage: str = "decision", include_vision: bool = False) -> str:
+        if stage == "research":
+            system = self.RESEARCH_SYSTEM_PROMPT + "\n\n" + self.RESEARCH_OUTPUT_FORMAT_TEMPLATE
+        else:
+            system = self.DECISION_SYSTEM_PROMPT + "\n\n" + self.DECISION_OUTPUT_FORMAT_TEMPLATE
+        if include_vision:
+            system += "\n\n" + self.VISION_SYSTEM_NOTE
+        return system
+
+    def _build_panel(
+        self,
+        context: Dict,
+        report_mode: str,
+        *,
+        include_instructions: bool,
+        instruction_prompt: str,
+        instruction_title: str,
+        include_prior_decisions: bool,
+        include_debug_sections: bool,
+        include_raw_appendix: bool,
+        output_template: str,
+        extra_sections: List[str] | None = None,
+    ) -> str:
         sections: List[str] = []
 
         if include_instructions:
             sections += [
-                "=== ANALYSIS INSTRUCTIONS (请先阅读此段指令，再分析下方数据) ===",
+                instruction_title,
                 "",
-                self.ANALYSIS_SYSTEM_PROMPT,
+                instruction_prompt,
                 "",
                 "─" * 60,
                 "",
             ]
 
-        # ── SECTION 1: RAW_FACTS ──────────────────────────────────────────────
-        # Objective market facts only. No derived labels, no directional bias.
-        # AI must complete PHASE A judgment based solely on this section.
+        sections += self._panel_body(
+            context,
+            report_mode=report_mode,
+            include_prior_decisions=include_prior_decisions,
+            include_debug_sections=include_debug_sections,
+            include_raw_appendix=include_raw_appendix,
+        )
+        if extra_sections:
+            sections += ["", *extra_sections]
         sections += [
-            self.PANEL_HEADER, "",
+            "",
+            "─" * 60,
+            "",
+            output_template,
+        ]
+        return "\n".join(sections).strip()
+
+    def _panel_body(
+        self,
+        context: Dict,
+        report_mode: str,
+        *,
+        include_prior_decisions: bool,
+        include_debug_sections: bool,
+        include_raw_appendix: bool,
+    ) -> List[str]:
+        sections: List[str] = [
+            self.PANEL_HEADER,
+            "",
             "╔══════════════════════════════════════════════════════════╗",
             "║  SECTION 1: RAW_FACTS  (客观市场事实，AI 独立判断依据)      ║",
             "╚══════════════════════════════════════════════════════════╝",
+            "",
         ]
-        sections.append("")
         sections += self._market_facts(context)
         sections.append("")
         sections += self._indicators(context)
@@ -661,58 +368,50 @@ STRICT ANTI-FAILURE RULES
         sections += self._position_facts(context)
         sections.append("")
         sections += self._external_drivers(context)
-        sections.append("")
-        sections += self._prior_decisions_context(context)
+        if include_prior_decisions:
+            sections.append("")
+            sections += self._prior_decisions_context(context)
 
-        # ── SECTION 2: DATA_QUALITY ───────────────────────────────────────────
-        # Coverage ratios, staleness flags, spoofing risk. Affects how to weight
-        # SECTION 1 evidence. Must be read before any conclusion.
         sections += [
             "",
             "╔══════════════════════════════════════════════════════════╗",
             "║  SECTION 2: DATA_QUALITY  (数据质量与可靠性约束)            ║",
             "╚══════════════════════════════════════════════════════════╝",
+            "",
         ]
-        sections.append("")
         sections += self._data_quality(context)
 
-        if report_mode == "full_debug":
-            # ── SECTION 3: DERIVED_SIGNALS (weak reference only) ──────────────
-            # State labels inferred from raw data. May carry directional bias.
-            # Only read AFTER completing independent judgment in PHASE A.
-            # If any field conflicts with SECTION 1, treat it as invalid.
+        if include_raw_appendix:
+            sections += [
+                "",
+                "╔══════════════════════════════════════════════════════════╗",
+                "║  SECTION 3: RAW_APPENDIX  (高价值原始附录，仅供二次核验)   ║",
+                "╚══════════════════════════════════════════════════════════╝",
+                "",
+            ]
+            sections += self._raw_appendix(context)
+
+        if include_debug_sections and report_mode == "full_debug":
             sections += [
                 "",
                 "╔══════════════════════════════════════════════════════════╗",
                 "║  SECTION 3: DERIVED_SIGNALS  ⚠ weak_ref_only — 仅在      ║",
                 "║  PHASE A 完成后参考，与 raw facts 冲突时忽略               ║",
                 "╚══════════════════════════════════════════════════════════╝",
+                "",
             ]
-            sections.append("")
             sections += self._derived_signals(context)
-
-            # ── SECTION 4: DEPLOYMENT_HINTS (do not use for direction) ────────
-            # Pre-computed plan zones, entry sides, and deployment scores.
-            # These are hypothesis outputs, NOT ground truth.
-            # Do NOT use these to decide long/short direction.
             sections += [
                 "",
                 "╔══════════════════════════════════════════════════════════╗",
                 "║  SECTION 4: DEPLOYMENT_HINTS  ⚠ optional_plan_hint —     ║",
                 "║  不得用于决定开仓方向，仅供执行细节参考                    ║",
                 "╚══════════════════════════════════════════════════════════╝",
+                "",
             ]
-            sections.append("")
             sections += self._deployment_hints(context)
 
-        sections += [
-            "",
-            "─" * 60,
-            "",
-            self.OUTPUT_FORMAT_TEMPLATE,
-        ]
-
-        return "\n".join(sections).strip()
+        return sections
 
     # ─── 1. DATA QUALITY ────────────────────────────────────────────────────
 
@@ -1523,6 +1222,28 @@ STRICT ANTI-FAILURE RULES
         return lines
 
     # ─── PRIOR DECISIONS CONTEXT ─────────────────────────────────────────────
+
+    @staticmethod
+    def _raw_appendix(ctx: Dict) -> List[str]:
+        raw = ctx.get("raw_appendix")
+        if not isinstance(raw, dict) or not raw:
+            return ["raw_appendix: unavailable"]
+        return [
+            "=== RAW APPENDIX ===",
+            "# 仅把这里当作底层证据补充，不得覆盖主面板里的结构优先级规则。",
+            json.dumps(raw, ensure_ascii=False, indent=2),
+        ]
+
+    @staticmethod
+    def _research_handoff_block(research_handoff: str) -> List[str]:
+        payload = (research_handoff or "").strip() or '{"stage": "research", "note": "empty_handoff"}'
+        return [
+            "╔══════════════════════════════════════════════════════════╗",
+            "║  RESEARCH HANDOFF  (研究阶段输出，供最终决策阶段消费)      ║",
+            "╚══════════════════════════════════════════════════════════╝",
+            "",
+            payload,
+        ]
 
     @staticmethod
     def _prior_decisions_context(ctx: Dict) -> List[str]:

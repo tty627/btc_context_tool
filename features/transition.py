@@ -5,9 +5,10 @@ Computes velocity and regime-shift features from existing data:
 - basis change velocity
 - funding regime classification
 - CVD slope acceleration
+- CVD divergence detection (price vs CVD new-high/low comparison)
 """
 
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from ._base import FeatureBase
 
@@ -15,12 +16,97 @@ from ._base import FeatureBase
 class TransitionMixin(FeatureBase):
 
     @staticmethod
+    def _detect_cvd_divergence(
+        candles_5m: Sequence[Dict],
+        lookback_bars: int = 12,
+    ) -> Dict:
+        """Detect hidden bullish/bearish CVD divergence using 5m kline taker data.
+
+        Compares the most recent *lookback_bars* 5m candles:
+        - price creates a new low but CVD does NOT → hidden bullish divergence
+        - price creates a new high but CVD does NOT → hidden bearish divergence
+
+        Strength is proportional to the gap between price and CVD extremes.
+        Returns a dict with keys: type, strength, window_bars.
+        """
+        candles = [
+            c for c in list(candles_5m)
+            if float(c.get("taker_buy_base", 0)) > 0 or float(c.get("volume", 0)) > 0
+        ]
+        if len(candles) < lookback_bars + 2:
+            return {"type": "no_divergence", "strength": "none", "window_bars": lookback_bars}
+
+        window = candles[-lookback_bars:]
+
+        # Build per-bar cumulative delta using taker buy fields
+        deltas: List[float] = []
+        for c in window:
+            buy = float(c.get("taker_buy_base", 0))
+            total = float(c.get("volume", 0))
+            deltas.append(buy - (total - buy))
+
+        cvd: List[float] = []
+        running = 0.0
+        for d in deltas:
+            running += d
+            cvd.append(running)
+
+        closes = [float(c["close"]) for c in window]
+
+        price_min_idx = closes.index(min(closes))
+        price_max_idx = closes.index(max(closes))
+        cvd_min_idx = cvd.index(min(cvd))
+        cvd_max_idx = cvd.index(max(cvd))
+
+        last_price = closes[-1]
+        last_cvd = cvd[-1]
+
+        div_type = "no_divergence"
+        strength = "none"
+
+        # Hidden bullish: price at/near new low but CVD not at new low
+        if price_min_idx == len(closes) - 1:
+            # Current close is the lowest in window
+            if cvd_min_idx != len(cvd) - 1:
+                # CVD did not confirm new low
+                price_drop_pct = abs(closes[price_min_idx] - closes[0]) / max(abs(closes[0]), 1) * 100
+                cvd_gap = abs(cvd[cvd_min_idx] - last_cvd) / (max(abs(min(cvd)), abs(max(cvd)), 0.001))
+                div_type = "bullish_hidden_div"
+                if cvd_gap > 0.3 and price_drop_pct > 0.3:
+                    strength = "strong"
+                elif cvd_gap > 0.1:
+                    strength = "moderate"
+                else:
+                    strength = "weak"
+
+        # Hidden bearish: price at/near new high but CVD not at new high
+        elif price_max_idx == len(closes) - 1:
+            if cvd_max_idx != len(cvd) - 1:
+                price_rise_pct = abs(closes[price_max_idx] - closes[0]) / max(abs(closes[0]), 1) * 100
+                cvd_gap = abs(cvd[cvd_max_idx] - last_cvd) / (max(abs(min(cvd)), abs(max(cvd)), 0.001))
+                div_type = "bearish_hidden_div"
+                if cvd_gap > 0.3 and price_rise_pct > 0.3:
+                    strength = "strong"
+                elif cvd_gap > 0.1:
+                    strength = "moderate"
+                else:
+                    strength = "weak"
+
+        return {
+            "type": div_type,
+            "strength": strength,
+            "window_bars": lookback_bars,
+        }
+
+    @classmethod
     def extract_transition_features(
+        cls,
         open_interest_trend: Dict,
         basis: Dict,
         funding: Dict,
         trade_flow: Dict,
         spot_perp: Dict,
+        candles_5m: Optional[Sequence[Dict]] = None,
     ) -> Dict:
         result: Dict = {}
 
@@ -117,5 +203,16 @@ class TransitionMixin(FeatureBase):
             "slope_15m": round(cvd_slope_15m, 4),
             "momentum": cvd_momentum,
         }
+
+        # ── CVD divergence detection ──────────────────────────────────────────
+        if candles_5m:
+            div_1h = cls._detect_cvd_divergence(candles_5m, lookback_bars=12)   # ~1h window
+            div_15m = cls._detect_cvd_divergence(candles_5m, lookback_bars=3)   # ~15m window
+            result["cvd_divergence"] = {
+                "1h_window": div_1h,
+                "15m_window": div_15m,
+            }
+        else:
+            result["cvd_divergence"] = None
 
         return result

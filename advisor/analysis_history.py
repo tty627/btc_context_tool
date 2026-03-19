@@ -23,6 +23,11 @@ try:
 except ImportError:
     from config import OUTPUT_DIR
 
+try:
+    from .analysis_parser import parse_analysis_snapshot
+except ImportError:
+    from advisor.analysis_parser import parse_analysis_snapshot  # type: ignore
+
 _HISTORY_FILE = OUTPUT_DIR / ".analysis_history.json"
 _MAX_ENTRIES = 10
 _TZ8 = timezone(timedelta(hours=8))
@@ -35,17 +40,17 @@ def _parse_field(text: str, key: str) -> str:
 
 
 def _parse_direction(analysis_text: str) -> str:
-    raw = _parse_field(analysis_text, "主结论")
-    if not raw:
+    snapshot = parse_analysis_snapshot(analysis_text)
+    if snapshot.get("has_open_position"):
         return ""
-    lower = raw.lower()
-    if "开多" in raw:
+    direction = snapshot.get("primary_decision")
+    if direction == "long":
         return "开多"
-    if "开空" in raw:
+    if direction == "short":
         return "开空"
-    if any(w in raw for w in ("等待", "不交易", "wait")):
+    if direction == "wait":
         return "等待"
-    return raw[:10]
+    return ""
 
 
 def _lookup_price_after(klines_1h: List[Dict], ref_ts_ms: int, bars_ahead: int) -> Optional[float]:
@@ -80,14 +85,15 @@ class AnalysisHistory:
         if not direction:
             logger.debug("analysis_history: could not parse direction, skipping record")
             return
+        snapshot = parse_analysis_snapshot(analysis_text)
 
         entry: Dict = {
             "ts_ms": int(time.time() * 1000),
             "price": round(float(price), 2),
             "direction": direction,
-            "execution_mode": _parse_field(analysis_text, "execution_mode"),
+            "execution_mode": str(snapshot.get("execution_mode", "")),
             "confidence": _parse_field(analysis_text, "confidence"),
-            "stop_loss": _parse_field(analysis_text, "stop_loss"),
+            "stop_loss": str(snapshot.get("stop_loss", "")),
             "outcome_1h_price": None,
             "outcome_4h_price": None,
             "outcome_resolved": False,

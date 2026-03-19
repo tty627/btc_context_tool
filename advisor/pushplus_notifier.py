@@ -9,6 +9,11 @@ from typing import Optional
 
 logger = logging.getLogger("btc_context.pushplus")
 
+try:
+    from .analysis_parser import is_wait_decision
+except ImportError:
+    from advisor.analysis_parser import is_wait_decision  # type: ignore
+
 
 class PushPlusNotifier:
     API_URL = "https://www.pushplus.plus/send"
@@ -32,7 +37,8 @@ class PushPlusNotifier:
                      "-X", "POST",
                      "-H", "Content-Type: application/json",
                      "-d", json.dumps(payload, ensure_ascii=False)],
-                    capture_output=True, text=True, timeout=25,
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=25,
                 )
                 if result.returncode != 0:
                     logger.warning("PushPlus curl attempt %d/%d failed: %s",
@@ -56,7 +62,7 @@ class PushPlusNotifier:
         return False
 
     def send_trade_signal(self, analysis_text: str, context: dict) -> bool:
-        """Parse AI analysis and send a concise trade notification."""
+        """Parse AI analysis and send full analysis as trade notification."""
         price = context.get("price", 0)
         symbol = context.get("symbol", "BTCUSDT")
 
@@ -65,34 +71,26 @@ class PushPlusNotifier:
             return False
 
         title = f"📊 {symbol} 交易信号 @{price:.0f}"
-        body = _extract_signal_summary(analysis_text, max_len=800)
-        return self.send(title, body)
+        body = _full_content(analysis_text, max_len=4000)
+        return self.send(title, body, template="markdown")
 
     def send_status(self, message: str) -> bool:
         return self.send("BTC Monitor", message)
 
 
 def _is_wait_decision(text: str) -> bool:
-    lower = text.lower()
-    for marker in ("execution_mode: wait", "execution_mode:wait",
-                    "主结论: 等待", "主结论: 不交易", "主结论:等待", "主结论:不交易",
-                    "position_action: hold_and_wait", "position_action: hold"):
-        if marker in lower or marker in text:
-            return True
-    if "wait_plan:" in text and "immediate_entry_plan:" not in text and "pullback_plan:" not in text and "trigger_plan:" not in text:
-        return True
-    return False
+    return is_wait_decision(text)
 
 
-def _extract_signal_summary(text: str, max_len: int = 800) -> str:
+def _extract_signal_summary(text: str, max_len: int = 4000) -> str:
     lines = text.split("\n")
-    keep_sections = []
+    keep_sections: list[str] = []
     current_section: list[str] = []
     important = False
 
     important_headers = (
-        "【当前动作】", "【执行模式】", "【执行方案】",
-        "【持仓主结论】", "【持仓处理】",
+        "【主判断】", "【执行与风险】", "【当前动作】", "【执行模式】", "【执行方案】",
+        "【持仓主判断】", "【持仓主结论】", "【持仓处理】",
         "【一句人话总结】",
         "immediate_entry_plan:", "pullback_plan:", "trigger_plan:",
     )
@@ -102,12 +100,17 @@ def _extract_signal_summary(text: str, max_len: int = 800) -> str:
         if any(stripped.startswith(h) for h in important_headers):
             if current_section and important:
                 keep_sections.extend(current_section)
-            current_section = [line]
+                keep_sections.append("")
+            # 将 【XXX】 转成 markdown 加粗标题
+            header_line = f"**{stripped}**" if stripped.startswith("【") else line
+            current_section = [header_line]
             important = True
         elif stripped.startswith("【") and stripped.endswith("】"):
             if current_section and important:
                 keep_sections.extend(current_section)
-            current_section = [line]
+                keep_sections.append("")
+            header_line = f"**{stripped}**"
+            current_section = [header_line]
             important = False
         else:
             current_section.append(line)
@@ -117,7 +120,23 @@ def _extract_signal_summary(text: str, max_len: int = 800) -> str:
 
     result = "\n".join(keep_sections).strip()
     if len(result) > max_len:
-        result = result[:max_len] + "\n..."
+        # 截断时尽量在换行处切，避免切断句子
+        cutoff = result.rfind("\n", 0, max_len)
+        if cutoff < max_len // 2:
+            cutoff = max_len
+        result = result[:cutoff] + "\n\n> *(内容过长，已截断)*"
     if not result:
         result = text[:max_len]
     return result
+
+
+def _full_content(text: str, max_len: int = 4000) -> str:
+    """Return the full analysis text, truncating gracefully only if necessary."""
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    cutoff = text.rfind("\n", 0, max_len)
+    if cutoff < max_len // 2:
+        cutoff = max_len
+    return text[:cutoff] + "\n\n> *(内容过长，已截断)*"

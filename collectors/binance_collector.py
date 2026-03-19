@@ -90,7 +90,11 @@ class BinanceFuturesCollector:
             client_kw: Dict[str, Any] = dict(
                 timeout=httpx.Timeout(timeout, connect=5.0),
                 follow_redirects=True,
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=60.0,
+                ),
                 trust_env=False,
             )
             if self._proxy:
@@ -553,31 +557,65 @@ class BinanceFuturesCollector:
 
     _SPOT_BASE_URL = "https://api.binance.com"
 
-    def get_spot_agg_trades(self, symbol: str, limit: int = 1000) -> List[Dict]:
-        """Fetch recent spot market agg trades for CVD comparison."""
-        url = f"{self._SPOT_BASE_URL}/api/v3/aggTrades?symbol={symbol}&limit={min(limit, 1000)}"
-        try:
-            payload = self._get_json_url(url)
-        except Exception:
-            return []
-        if not isinstance(payload, list):
-            return []
-        trades: List[Dict] = []
-        for row in payload:
-            price = float(row["p"])
-            qty = float(row["q"])
-            is_buyer_maker = bool(row["m"])
-            trades.append(
-                {
-                    "price": price,
-                    "qty": qty,
-                    "quote_qty": price * qty,
-                    "aggressor_side": "sell" if is_buyer_maker else "buy",
-                    "timestamp": int(row["T"]),
-                }
+    def get_spot_agg_trades(
+        self,
+        symbol: str,
+        limit: int = 1000,
+        window_minutes: int = 15,
+    ) -> List[Dict]:
+        """Fetch spot aggTrades covering at least *window_minutes*.
+
+        Paginates backward so that the 5m / 15m windows in
+        extract_spot_perp_features see genuinely different data.
+        """
+        import time as _time
+
+        end_ts = int(_time.time() * 1000)
+        start_ts = end_ts - window_minutes * 60 * 1000
+        all_trades: List[Dict] = []
+        cursor_end = end_ts
+        max_pages = 20
+
+        for _ in range(max_pages):
+            url = (
+                f"{self._SPOT_BASE_URL}/api/v3/aggTrades"
+                f"?symbol={symbol}"
+                f"&startTime={start_ts}&endTime={cursor_end}"
+                f"&limit=1000"
             )
-        trades.sort(key=lambda x: x["timestamp"])
-        return trades
+            try:
+                payload = self._get_json_url(url)
+            except Exception:
+                break
+            if not isinstance(payload, list) or not payload:
+                break
+            for row in payload:
+                price = float(row["p"])
+                qty = float(row["q"])
+                is_buyer_maker = bool(row["m"])
+                all_trades.append(
+                    {
+                        "price": price,
+                        "qty": qty,
+                        "quote_qty": price * qty,
+                        "aggressor_side": "sell" if is_buyer_maker else "buy",
+                        "timestamp": int(row["T"]),
+                    }
+                )
+            earliest = int(payload[0]["T"])
+            if earliest <= start_ts or len(payload) < 1000:
+                break
+            cursor_end = earliest - 1
+
+        seen: set = set()
+        deduped: List[Dict] = []
+        for t in all_trades:
+            key = (t["timestamp"], t["price"], t["qty"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(t)
+        deduped.sort(key=lambda x: x["timestamp"])
+        return deduped
 
     def get_spot_klines(self, symbol: str, interval: str, limit: int) -> List[Dict]:
         """Fetch spot market klines including taker buy fields."""

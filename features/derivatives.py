@@ -340,21 +340,33 @@ class DerivativesMixin(FeatureBase):
         binance_oi: float,
         okx_oi: Dict,
         bybit_oi: Dict,
+        current_price: float = 0.0,
     ) -> Dict:
-        """Aggregate open interest across Binance / OKX / Bybit.
+        """Aggregate OI across exchanges, normalised to BTC.
 
-        OI units differ by exchange (Binance: contracts/BTC, OKX: BTC, Bybit: USDT).
-        Values are stored as-is with exchange labels for AI interpretation.
+        - Binance /fapi/v1/openInterest returns BTC for BTCUSDT linear.
+        - OKX oiCcy is already BTC.
+        - Bybit linear OI is returned in BTC (despite "USDT" label in docs).
+        All stored as BTC for safe cross-exchange comparison.
         """
         sources: Dict[str, Dict] = {
             "binance": {"available": True, "oi": round(binance_oi, 4), "unit": "BTC"},
         }
         if okx_oi.get("available"):
-            sources["okx"] = {"available": True, "oi": round(float(okx_oi.get("oi", 0)), 4), "unit": "BTC"}
+            sources["okx"] = {
+                "available": True,
+                "oi": round(float(okx_oi.get("oi", 0)), 4),
+                "unit": "BTC",
+            }
         else:
             sources["okx"] = {"available": False, "oi": 0.0}
         if bybit_oi.get("available"):
-            sources["bybit"] = {"available": True, "oi": round(float(bybit_oi.get("oi", 0)), 4), "unit": "USDT"}
+            raw = float(bybit_oi.get("oi", 0))
+            sources["bybit"] = {
+                "available": True,
+                "oi": round(raw, 4),
+                "unit": "BTC",
+            }
         else:
             sources["bybit"] = {"available": False, "oi": 0.0}
 

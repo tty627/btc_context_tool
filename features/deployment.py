@@ -8,13 +8,20 @@ from ._base import FeatureBase
 class DeploymentMixin(FeatureBase):
     @staticmethod
     def _make_level(name: str, price: float, source: str, priority: int, current_price: float) -> Dict:
+        # role is a POSITIONAL label only: below/above current price at snapshot time.
+        # It does NOT confirm buying or selling pressure. Use key_level_flows to validate.
         role = "support" if price < current_price else "resistance" if price > current_price else "pivot"
+        dist_pct = abs(price - current_price) / max(current_price, 1.0) * 100
+        # Flag levels within 0.3% of current price — these may have just been crossed.
+        near_price = dist_pct <= 0.3
         return {
             "name": name,
             "price": round(price, 6),
             "source": source,
             "priority": priority,
             "role": role,
+            "dist_pct": round(dist_pct, 4),
+            "near_price": near_price,
         }
 
     @classmethod
